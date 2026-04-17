@@ -7,6 +7,7 @@ training images with matching Qwen-Image-style caption files.
 
 from __future__ import annotations
 
+import base64
 import concurrent.futures
 import copy
 import ctypes
@@ -15,9 +16,10 @@ import os
 import queue
 import re
 import sys
+import tempfile
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -56,6 +58,19 @@ SETTINGS_FILENAME = "_settings.json"
 SETTINGS_VERSION = 1
 SETTINGS_DEBOUNCE_MS = 400
 
+# ---- Generation mode ----
+MODE_SYNC = "sync"
+MODE_BATCH = "batch"
+MODE_CHOICES = [MODE_SYNC, MODE_BATCH]
+DEFAULT_MODE = MODE_SYNC
+BATCH_COST_MULTIPLIER = 0.5     # Google Batch API: 50% of standard pricing
+BATCH_STATE_FILENAME = "_batch.json"
+BATCH_POLL_SECONDS = 30
+BATCH_COMPLETED_STATES = {
+    "JOB_STATE_SUCCEEDED", "JOB_STATE_FAILED",
+    "JOB_STATE_CANCELLED", "JOB_STATE_EXPIRED",
+}
+
 MANIFEST_FILENAME = "_manifest.json"
 MANIFEST_VERSION = 1
 VALIDATE_MODEL = "gemini-2.5-flash"
@@ -73,10 +88,14 @@ VALIDATE_COST_PER_CALL = 0.00015
 CAPTION_COST_PER_CALL = 0.00015
 
 
-def estimate_cost(total_images: int, model: str, size: str, verify_captions: bool = False) -> float:
+def estimate_cost(total_images: int, model: str, size: str,
+                  verify_captions: bool = False, mode: str = MODE_SYNC) -> float:
     per_img = PRICING_PER_IMAGE.get(model, {}).get(size, 0.04)
+    if mode == MODE_BATCH:
+        per_img *= BATCH_COST_MULTIPLIER
     total = total_images * per_img
     if verify_captions:
+        # caption verify stays sync regardless of image mode
         total += total_images * CAPTION_COST_PER_CALL
     return total
 
@@ -703,6 +722,441 @@ def run_job(chars, root, output_dir, api_key, model, image_size, aspect_mode,
             text=f"[{char.name}] summary — saved {done}, refused {refused}, errors {errors}"))
 
     msgq.put(ProgressMsg(kind="log", text="Batch complete."))
+    msgq.put(ProgressMsg(kind="done"))
+
+
+# -------------------------------------------------------------------------
+# Batch mode (Google Batch API — 50% off, up to 24h turnaround)
+# -------------------------------------------------------------------------
+
+def _batch_state_path(output_dir: Path) -> Path:
+    return output_dir / BATCH_STATE_FILENAME
+
+
+def load_batch_state(output_dir: Path) -> Optional[dict]:
+    p = _batch_state_path(output_dir)
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def save_batch_state(output_dir: Path, state: dict):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    p = _batch_state_path(output_dir)
+    tmp = p.with_suffix(".json.tmp")
+    try:
+        tmp.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, p)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
+
+
+def clear_batch_state(output_dir: Path):
+    p = _batch_state_path(output_dir)
+    try:
+        p.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _b64(data: bytes) -> str:
+    return base64.b64encode(data).decode("ascii")
+
+
+def _build_batch_request(spec, trigger, outfit, face_b64, body_b64, image_size, aspect) -> dict:
+    """Build a single generateContent-style request dict for the batch JSONL."""
+    prompt_text = P.build_prompt_text(spec, trigger, outfit)
+    parts = [
+        {"text": "--- [Reference Image 1: FACE identity lock] ---"},
+        {"inlineData": {"mimeType": "image/jpeg", "data": face_b64}},
+        {"text": "--- [Reference Image 2: BODY identity lock] ---"},
+        {"inlineData": {"mimeType": "image/jpeg", "data": body_b64}},
+        {"text": prompt_text},
+    ]
+    gen_config: dict = {"responseModalities": ["IMAGE"]}
+    image_cfg: dict = {}
+    if image_size and image_size != "AUTO":
+        image_cfg["imageSize"] = image_size
+    if aspect and aspect != "AUTO":
+        image_cfg["aspectRatio"] = aspect
+    if image_cfg:
+        gen_config["imageConfig"] = image_cfg
+
+    return {
+        "contents": [{"parts": parts}],
+        "systemInstruction": {"parts": [{"text": P.SYSTEM_PROMPT}]},
+        "generationConfig": gen_config,
+    }
+
+
+def build_batch_jsonl(chars: list, output_dir: Path, image_size: str, aspect_mode: str,
+                      msgq: "queue.Queue[ProgressMsg]") -> tuple[Path, dict]:
+    """Construct the JSONL file and a key_map that maps each request key
+    back to (char_name, slot, flat, category).
+
+    Returns (jsonl_path, key_map). Caller is responsible for upload + cleanup.
+    """
+    key_map: dict[str, dict] = {}
+    tmp = tempfile.NamedTemporaryFile(
+        prefix="forge_batch_", suffix=".jsonl", delete=False, mode="w", encoding="utf-8",
+    )
+    jsonl_path = Path(tmp.name)
+    written = 0
+    try:
+        for char in chars:
+            out_char = output_dir / char.name
+            out_char.mkdir(parents=True, exist_ok=True)
+            manifest = load_manifest(out_char)
+            manifest["trigger"] = char.trigger
+            manifest["char"] = char.name
+            manifest["vary_outfit"] = char.vary_outfit
+            if char.distribution:
+                manifest["distribution"] = dict(char.distribution)
+
+            total_count = sum(char.distribution.values()) if char.distribution else char.count
+            slots_to_fill = []
+            for slot in range(1, total_count + 1):
+                if (out_char / f"{slot:03d}.png").exists() and (out_char / f"{slot:03d}.txt").exists():
+                    continue
+                slots_to_fill.append(slot)
+
+            if not slots_to_fill:
+                msgq.put(ProgressMsg(kind="log",
+                    text=f"[{char.name}] all {total_count} slots present; skipping in batch"))
+                continue
+
+            try:
+                face_bytes = _load_jpeg_bytes(char.face)
+                body_bytes = _load_jpeg_bytes(char.body)
+            except Exception as e:
+                msgq.put(ProgressMsg(kind="error", char=char.name,
+                                     text=f"[{char.name}] failed to load refs: {e}"))
+                continue
+            face_b64 = _b64(face_bytes)
+            body_b64 = _b64(body_bytes)
+
+            used_flats = used_flats_in_manifest(manifest)
+            if char.distribution:
+                slots_by_cat: dict[str, list[int]] = {}
+                for slot in slots_to_fill:
+                    existing = manifest.get("slots", {}).get(f"{slot:03d}", {})
+                    cat = existing.get("category") or P.slot_to_category(slot, char.distribution)
+                    slots_by_cat.setdefault(cat, []).append(slot)
+                slot_jobs: dict[int, tuple] = {}
+                running_exclude = set(used_flats)
+                for cat, slots_in_cat in slots_by_cat.items():
+                    cat_dist = {c: 0 for c in P.CATEGORY_ORDER}
+                    cat_dist[cat] = len(slots_in_cat)
+                    for slot, job in zip(slots_in_cat, P.plan_jobs_distributed(
+                            cat_dist, vary_outfit=char.vary_outfit,
+                            trigger=char.trigger, exclude=running_exclude)):
+                        slot_jobs[slot] = job
+                        running_exclude.add(job[0])
+                jobs_full = [(slot, *slot_jobs[slot]) for slot in slots_to_fill if slot in slot_jobs]
+            else:
+                plain = P.plan_jobs(len(slots_to_fill), vary_outfit=char.vary_outfit,
+                                    trigger=char.trigger, exclude=used_flats)
+                jobs_full = [(slot, flat, spec, outfit, None)
+                             for slot, (flat, spec, outfit) in zip(slots_to_fill, plain)]
+
+            for slot, flat, spec, outfit, category in jobs_full:
+                aspect = P.smart_aspect(spec["framing"]) if aspect_mode.startswith("smart") else aspect_mode
+                key = f"{char.name}__{slot:03d}"
+                request = _build_batch_request(spec, char.trigger, outfit,
+                                               face_b64, body_b64, image_size, aspect)
+                caption = P.build_caption(spec, char.trigger, outfit)
+                line = json.dumps({"key": key, "request": request}, ensure_ascii=False)
+                tmp.write(line + "\n")
+                written += 1
+
+                key_map[key] = {
+                    "char": char.name,
+                    "slot": slot,
+                    "flat": flat,
+                    "category": category,
+                    "caption": caption,
+                    "aspect": aspect,
+                    "framing": spec["framing"],
+                }
+
+            # Save manifest prep (even pre-submit) so if app crashes we know chars
+            save_manifest(out_char, manifest)
+    finally:
+        tmp.close()
+
+    if written == 0:
+        try:
+            jsonl_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    msgq.put(ProgressMsg(kind="log", text=f"Built batch JSONL with {written} request(s)"))
+    return jsonl_path, key_map
+
+
+def run_batch_submit(chars: list, output_dir: Path, api_key: str, model: str,
+                     image_size: str, aspect_mode: str,
+                     msgq: "queue.Queue[ProgressMsg]", stop_event: threading.Event):
+    """Build JSONL, upload, submit batch. Writes _batch.json state file.
+    Emits kind='batch_submitted' or kind='error' then 'done'.
+    """
+    enabled = [c for c in chars if c.enabled]
+    if not enabled:
+        msgq.put(ProgressMsg(kind="error", text="no characters enabled for batch"))
+        msgq.put(ProgressMsg(kind="done"))
+        return
+
+    try:
+        engine = GeminiEngine(api_key=api_key, model=model)
+    except Exception as e:
+        msgq.put(ProgressMsg(kind="error", text=f"Failed to init Gemini client: {e}"))
+        msgq.put(ProgressMsg(kind="done"))
+        return
+
+    msgq.put(ProgressMsg(kind="log",
+        text=f"Preparing batch: {len(enabled)} character(s), "
+             f"resolution={image_size}, aspect={aspect_mode}, model={model}"))
+
+    try:
+        jsonl_path, key_map = build_batch_jsonl(enabled, output_dir, image_size, aspect_mode, msgq)
+    except Exception as e:
+        msgq.put(ProgressMsg(kind="error", text=f"Failed to build batch JSONL: {e}"))
+        msgq.put(ProgressMsg(kind="done"))
+        return
+
+    if not key_map:
+        msgq.put(ProgressMsg(kind="log", text="Nothing to batch — all slots already filled."))
+        msgq.put(ProgressMsg(kind="done"))
+        return
+
+    # Upload JSONL
+    try:
+        msgq.put(ProgressMsg(kind="log", text=f"Uploading batch JSONL ({jsonl_path.stat().st_size:,} bytes)..."))
+        types = engine._types
+        uploaded = engine.client.files.upload(
+            file=str(jsonl_path),
+            config=types.UploadFileConfig(
+                display_name=f"forge_batch_{int(time.time())}",
+                mime_type="jsonl",
+            ),
+        )
+    except Exception as e:
+        msgq.put(ProgressMsg(kind="error", text=f"File upload failed: {e}"))
+        try:
+            jsonl_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        msgq.put(ProgressMsg(kind="done"))
+        return
+    finally:
+        # Can remove local JSONL now that it's uploaded
+        try:
+            jsonl_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    # Submit batch
+    try:
+        batch_job = engine.client.batches.create(
+            model=model,
+            src=uploaded.name,
+            config={"display_name": f"lora-forge-{int(time.time())}"},
+        )
+    except Exception as e:
+        msgq.put(ProgressMsg(kind="error", text=f"Batch submit failed: {e}"))
+        msgq.put(ProgressMsg(kind="done"))
+        return
+
+    # Persist state
+    state = {
+        "version": 1,
+        "batch_name": batch_job.name,
+        "submitted_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "model": model,
+        "image_size": image_size,
+        "aspect_mode": aspect_mode,
+        "api_key_hint": f"len={len(api_key)}",  # do NOT persist the key itself
+        "total_requests": len(key_map),
+        "key_map": key_map,
+    }
+    try:
+        save_batch_state(output_dir, state)
+    except Exception as e:
+        msgq.put(ProgressMsg(kind="log", text=f"WARN — state save failed ({e}); batch continues but cannot resume on close"))
+
+    msgq.put(ProgressMsg(kind="log",
+        text=f"Batch submitted: {batch_job.name} · {len(key_map)} request(s) · "
+             f"initial state={batch_job.state.name}"))
+    msgq.put(ProgressMsg(kind="batch_submitted",
+                         text=batch_job.name, current=len(key_map)))
+    msgq.put(ProgressMsg(kind="done"))
+
+
+def run_batch_poll(output_dir: Path, api_key: str, model: str,
+                   msgq: "queue.Queue[ProgressMsg]", stop_event: threading.Event):
+    """Poll an already-submitted batch until completion or stop_event, then write results."""
+    state = load_batch_state(output_dir)
+    if not state:
+        msgq.put(ProgressMsg(kind="error", text="no batch state found to poll"))
+        msgq.put(ProgressMsg(kind="done"))
+        return
+
+    batch_name = state["batch_name"]
+    key_map = state["key_map"]
+
+    try:
+        engine = GeminiEngine(api_key=api_key, model=model)
+    except Exception as e:
+        msgq.put(ProgressMsg(kind="error", text=f"Failed to init Gemini client for polling: {e}"))
+        msgq.put(ProgressMsg(kind="done"))
+        return
+
+    msgq.put(ProgressMsg(kind="log", text=f"Polling batch {batch_name} every {BATCH_POLL_SECONDS}s..."))
+
+    job = None
+    while not stop_event.is_set():
+        try:
+            job = engine.client.batches.get(name=batch_name)
+        except Exception as e:
+            msgq.put(ProgressMsg(kind="log", text=f"poll transient error: {e}"))
+            for _ in range(BATCH_POLL_SECONDS):
+                if stop_event.is_set():
+                    break
+                time.sleep(1)
+            continue
+
+        state_name = getattr(job.state, "name", str(job.state))
+        msgq.put(ProgressMsg(kind="batch_status", text=state_name))
+
+        if state_name in BATCH_COMPLETED_STATES:
+            break
+
+        for _ in range(BATCH_POLL_SECONDS):
+            if stop_event.is_set():
+                break
+            time.sleep(1)
+
+    if stop_event.is_set() and job and getattr(job.state, "name", "") not in BATCH_COMPLETED_STATES:
+        msgq.put(ProgressMsg(kind="log", text="poll stopped by user — batch still running on server"))
+        msgq.put(ProgressMsg(kind="done"))
+        return
+
+    final_state = getattr(job.state, "name", "unknown") if job else "unknown"
+
+    if final_state != "JOB_STATE_SUCCEEDED":
+        msgq.put(ProgressMsg(kind="error", text=f"Batch finished in state: {final_state}"))
+        clear_batch_state(output_dir)
+        msgq.put(ProgressMsg(kind="done"))
+        return
+
+    # Download results
+    try:
+        result_file = job.dest.file_name if job.dest else None
+        if not result_file:
+            raise RuntimeError("no dest file on completed batch")
+        msgq.put(ProgressMsg(kind="log", text=f"Downloading results from {result_file}..."))
+        result_bytes = engine.client.files.download(file=result_file)
+    except Exception as e:
+        msgq.put(ProgressMsg(kind="error", text=f"Result download failed: {e}"))
+        msgq.put(ProgressMsg(kind="done"))
+        return
+
+    try:
+        text = result_bytes.decode("utf-8")
+    except Exception:
+        text = result_bytes.decode("utf-8", errors="replace")
+
+    saved = 0
+    refused = 0
+    errors = 0
+    manifests: dict[str, dict] = {}  # char_name -> manifest dict
+
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+        except Exception:
+            errors += 1
+            continue
+        key = entry.get("key")
+        info = key_map.get(key)
+        if not info:
+            continue
+        char_name = info["char"]
+        slot = info["slot"]
+        flat = info["flat"]
+        category = info.get("category")
+        caption = info.get("caption", "")
+
+        out_char = output_dir / char_name
+        out_img = out_char / f"{slot:03d}.png"
+        out_txt = out_char / f"{slot:03d}.txt"
+
+        # Lazily load per-char manifests for incremental updates
+        if char_name not in manifests:
+            manifests[char_name] = load_manifest(out_char)
+
+        resp = entry.get("response") or {}
+        candidates = resp.get("candidates") or []
+        image_data = None
+        refusal_text = ""
+        for cand in candidates:
+            content = cand.get("content") or {}
+            for part in (content.get("parts") or []):
+                inline = part.get("inlineData") or part.get("inline_data")
+                if inline and inline.get("data"):
+                    image_data = inline["data"]
+                    break
+                if part.get("text"):
+                    refusal_text = (refusal_text + " | " + part["text"]).strip(" |")
+            if image_data:
+                break
+            fr = cand.get("finishReason") or cand.get("finish_reason")
+            if fr:
+                refusal_text = (refusal_text + f" finish={fr}").strip()
+
+        if image_data:
+            try:
+                from io import BytesIO
+                img_bytes = base64.b64decode(image_data)
+                with Image.open(BytesIO(img_bytes)) as im:
+                    im.save(out_img, format="PNG")
+                out_txt.write_text(caption, encoding="utf-8")
+                extra = {"category": category} if category else {}
+                record_slot(manifests[char_name], slot, flat, kept=True, **extra)
+                saved += 1
+            except Exception as e:
+                errors += 1
+                msgq.put(ProgressMsg(kind="error", char=char_name,
+                                     text=f"[{char_name}] {slot:03d} save failed: {e}"))
+        else:
+            refused += 1
+            extra = {"refused": True, "refuse_reason": (refusal_text or "no image")[:200]}
+            if category:
+                extra["category"] = category
+            record_slot(manifests[char_name], slot, flat, kept=False, **extra)
+
+        msgq.put(ProgressMsg(kind="progress", char=char_name,
+                             current=slot, total=0))
+
+    # Flush manifests
+    for char_name, manifest in manifests.items():
+        try:
+            save_manifest(output_dir / char_name, manifest)
+        except Exception as e:
+            msgq.put(ProgressMsg(kind="error", text=f"manifest save failed for {char_name}: {e}"))
+
+    msgq.put(ProgressMsg(kind="log",
+        text=f"Batch complete — saved {saved}, refused {refused}, errors {errors}"))
+    clear_batch_state(output_dir)
     msgq.put(ProgressMsg(kind="done"))
 
 
@@ -1875,6 +2329,9 @@ class ForgeApp:
         # Enable saving once the initial UI + scan has settled
         self.root.after(600, lambda: setattr(self, "_settings_ready", True))
 
+        # Check for a pending batch from a previous session (after scan + settling)
+        self.root.after(800, self._maybe_resume_batch)
+
         # Save on close
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -2023,6 +2480,51 @@ class ForgeApp:
                  bg=COLOR["surface"], fg=COLOR["muted"],
                  font=(FONT_UI, 9, "italic")).grid(row=0, column=4, sticky="w", padx=(24, 0))
 
+        # Row 1bb: generation mode (sync / batch)
+        row1bb = tk.Frame(cfg, bg=COLOR["surface"])
+        row1bb.pack(fill="x", pady=(14, 0))
+
+        tk.Label(row1bb, text="MODE", bg=COLOR["surface"], fg=COLOR["muted"],
+                 font=(FONT_UI, 8, "bold")).grid(row=0, column=0, sticky="w", padx=(0, 14))
+        self.mode_var = tk.StringVar(value=s.get("mode", DEFAULT_MODE))
+
+        def _mk_mode_btn(parent, label, value):
+            btn = tk.Label(parent, text=label, bg=COLOR["surface2"], fg=COLOR["text_dim"],
+                           bd=0, highlightthickness=1, highlightbackground=COLOR["border"],
+                           cursor="hand2", padx=14, pady=7, font=(FONT_UI, 10))
+
+            def _refresh(*_):
+                on = (self.mode_var.get() == value)
+                btn.configure(
+                    bg=COLOR["accent"] if on else COLOR["surface2"],
+                    fg="#1a0e08" if on else COLOR["text_dim"],
+                    highlightbackground=COLOR["accent"] if on else COLOR["border"],
+                )
+            _refresh()
+            self.mode_var.trace_add("write", _refresh)
+            btn.bind("<Button-1>", lambda _e, v=value: self.mode_var.set(v))
+            return btn
+
+        _mk_mode_btn(row1bb, "sync   (live, full cost)", MODE_SYNC).grid(
+            row=0, column=1, sticky="w", padx=(0, 6))
+        _mk_mode_btn(row1bb, "batch  (50% off, up to 24h)", MODE_BATCH).grid(
+            row=0, column=2, sticky="w", padx=(0, 12))
+
+        self.mode_hint_var = tk.StringVar()
+        tk.Label(row1bb, textvariable=self.mode_hint_var,
+                 bg=COLOR["surface"], fg=COLOR["muted"],
+                 font=(FONT_UI, 9, "italic")).grid(row=0, column=3, sticky="w", padx=(12, 0))
+
+        def _update_mode_hint(*_):
+            if self.mode_var.get() == MODE_BATCH:
+                self.mode_hint_var.set(
+                    "submits an async batch to Google — poll runs in background, results arrive together"
+                )
+            else:
+                self.mode_hint_var.set("images stream back live as each one completes")
+        _update_mode_hint()
+        self.mode_var.trace_add("write", _update_mode_hint)
+
         # Row 1c: verify captions + prompt preview + cost estimator
         row1c = tk.Frame(cfg, bg=COLOR["surface"])
         row1c.pack(fill="x", pady=(14, 0))
@@ -2052,7 +2554,7 @@ class ForgeApp:
                  font=(FONT_MONO, 10, "bold")).grid(row=0, column=4, sticky="e", padx=(0, 0))
 
         # Update estimator whenever any relevant variable changes
-        for var in (self.model_var, self.size_var, self.verify_var):
+        for var in (self.model_var, self.size_var, self.verify_var, self.mode_var):
             try:
                 var.trace_add("write", lambda *_: self._update_cost_estimate())
             except tk.TclError:
@@ -2317,7 +2819,7 @@ class ForgeApp:
     def _bind_global_save_traces(self):
         for var in (self.api_var, self.model_var, self.size_var, self.aspect_var,
                     self.default_count_var, self.workers_var, self.verify_var,
-                    self.root_var, self.remember_api_var):
+                    self.root_var, self.remember_api_var, self.mode_var):
             try:
                 var.trace_add("write", lambda *_: self._schedule_save())
             except tk.TclError:
@@ -2376,6 +2878,7 @@ class ForgeApp:
             "workers": int(self.workers_var.get()),
             "verify_captions": bool(self.verify_var.get()),
             "dataset_root": self.root_var.get(),
+            "mode": self.mode_var.get(),
             "characters": chars_data,
         }
 
@@ -2433,10 +2936,13 @@ class ForgeApp:
         if total == 0:
             self.cost_var.set("est. cost: — (no characters enabled)")
             return
+        mode = self.mode_var.get() if hasattr(self, "mode_var") else MODE_SYNC
         dollars = estimate_cost(total, self.model_var.get(), self.size_var.get(),
-                                verify_captions=bool(self.verify_var.get()))
+                                verify_captions=bool(self.verify_var.get()),
+                                mode=mode)
         verify_tag = " + verify" if self.verify_var.get() else ""
-        self.cost_var.set(f"est. cost: ${dollars:,.2f}  ({total} images{verify_tag})")
+        mode_tag = " · batch 50% off" if mode == MODE_BATCH else ""
+        self.cost_var.set(f"est. cost: ${dollars:,.2f}  ({total} images{verify_tag}){mode_tag}")
 
     def _wire_row_cost_traces(self):
         """After scanning, hook each row's count/enabled vars to cost updater."""
@@ -2565,20 +3071,67 @@ class ForgeApp:
         self.generate_btn.set_enabled(False)
         self.stop_btn.set_enabled(True)
 
-        self.worker = threading.Thread(
-            target=run_job,
-            args=(chars, root, output_dir, api_key, self.model_var.get(),
-                  self.size_var.get(), self.aspect_var.get(),
-                  int(self.workers_var.get()),
-                  bool(self.verify_var.get()),
-                  self.msgq, self.stop_event),
-            daemon=True,
-        )
+        mode = self.mode_var.get()
+        if mode == MODE_BATCH:
+            self._log("submitting batch to Google (will poll in background)...", "info")
+            self.worker = threading.Thread(
+                target=run_batch_submit,
+                args=(chars, output_dir, api_key, self.model_var.get(),
+                      self.size_var.get(), self.aspect_var.get(),
+                      self.msgq, self.stop_event),
+                daemon=True,
+            )
+        else:
+            self.worker = threading.Thread(
+                target=run_job,
+                args=(chars, root, output_dir, api_key, self.model_var.get(),
+                      self.size_var.get(), self.aspect_var.get(),
+                      int(self.workers_var.get()),
+                      bool(self.verify_var.get()),
+                      self.msgq, self.stop_event),
+                daemon=True,
+            )
         self.worker.start()
 
     def _stop_job(self):
         self._log("stop requested — finishing current image then halting…", "dim")
         self.stop_event.set()
+
+    def _spawn_batch_poll(self, output_dir: Path):
+        """Start the background poller for a submitted batch."""
+        api_key = self.api_var.get().strip()
+        if not api_key:
+            self._log("[batch] no API key; cannot poll", "err")
+            return
+        self._job_running = True
+        self.stop_event.clear()
+        self.generate_btn.set_enabled(False)
+        self.stop_btn.set_enabled(True)
+        self.worker = threading.Thread(
+            target=run_batch_poll,
+            args=(output_dir, api_key, self.model_var.get(),
+                  self.msgq, self.stop_event),
+            daemon=True,
+        )
+        self.worker.start()
+
+    def _maybe_resume_batch(self):
+        """On launch, check for a pending batch state file and offer to resume polling."""
+        root = Path(self.root_var.get())
+        output_dir = root / DEFAULT_OUTPUT_SUBDIR
+        state = load_batch_state(output_dir)
+        if not state:
+            return
+        name = state.get("batch_name", "?")
+        total = state.get("total_requests", "?")
+        self._log(f"[batch] pending batch detected: {name} ({total} req)", "info")
+        if messagebox.askyesno(
+            "pending batch",
+            f"a submitted batch is still waiting for results:\n\n"
+            f"  {name}\n  {total} request(s)\n\n"
+            f"resume polling now?",
+        ):
+            self._spawn_batch_poll(output_dir)
 
     # -------- log + polling --------
     _LOG_MAX_LINES = 2000
@@ -2610,6 +3163,17 @@ class ForgeApp:
             pass  # root destroyed
 
     def _handle_msg(self, msg: ProgressMsg):
+        if msg.kind == "batch_submitted":
+            # Kick off the polling thread automatically after submit.
+            self._log(f"batch accepted — polling for results (Ctrl+stop to pause poll)", "ok")
+            self.status_var.set(f"batch submitted · 0/{msg.current}")
+            root = Path(self.root_var.get())
+            output_dir = root / DEFAULT_OUTPUT_SUBDIR
+            self._spawn_batch_poll(output_dir)
+            return
+        if msg.kind == "batch_status":
+            self.status_var.set(f"batch state: {msg.text}")
+            return
         if msg.kind == "log":
             self._log(msg.text)
         elif msg.kind == "error":
