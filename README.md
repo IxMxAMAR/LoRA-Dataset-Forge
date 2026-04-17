@@ -1,42 +1,86 @@
 # LoRA-Dataset-Forge
 
-A Tkinter GUI that turns a face reference + body reference into a fully diverse, identity-locked character training dataset for LoRA fine-tuning — powered by Google's Nano Banana 2 (`gemini-3.1-flash-image-preview`) or Nano Banana Pro.
+> **Two photos in. A trainer-ready LoRA dataset out.**
+> Your character, rendered a thousand ways — with the same face every time.
 
-Built specifically for character LoRAs on Qwen-Image / Qwen-Image-Edit, but the output format works with any trainer that accepts a folder of images + matching `.txt` captions (kohya_ss, ai-toolkit, musubi-tuner, OneTrainer, etc.).
+![Python](https://img.shields.io/badge/python-3.10+-blue.svg)
+![License](https://img.shields.io/badge/license-MIT-green.svg)
+![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)
+![Target](https://img.shields.io/badge/target-Qwen--Image%20LoRA-ff7a59.svg)
 
-> _Screenshot goes here — add `docs/screenshot.png` and link it in when you have one._
+---
 
-## What it does
+## The problem it solves
 
-Point it at a folder of characters (one subfolder per character, each containing a face shot + a body shot) and it will, per character:
+Training a character LoRA takes 30 to 100 consistent images of one person. Getting those images is the hard part.
 
-1. Generate N identity-locked training images by sending **both references** to Nano Banana 2 on every call, with a strong system prompt that locks facial identity and body proportions.
-2. Vary framing, camera angle, expression, pose, environment, weather, lighting, and (optionally) outfit across a deterministic combinatorial shuffle that has **4+ billion unique combinations** — at count = 500, every image has a unique spec.
-3. Write Qwen-Image-style single-line natural-language captions to `.txt` sidecars, with the trigger word first.
-4. Pick a smart aspect ratio per framing (3:4 close-ups, 4:5 mid-shots, 2:3 three-quarter body, 9:16 full body) so your dataset lands in Qwen-Image's native buckets.
-5. Let you review the output in a thumbnail grid, validate face similarity with a Gemini vision-model judge, click to reject bad ones, and refill the gaps with guaranteed-fresh specs (no repeats).
-6. Export ready-to-use dataset configs for `musubi-tuner` (TOML) and `ai-toolkit` (YAML), plus a training README with launch commands.
+A photoshoot is expensive and inconsistent. Stable-diffusion-scraped photos drift between generations. Hand-captioning is tedious. Bucketing is an afterthought. By the time you've wrangled all of it, you've spent two days on dataset prep and you haven't even started training.
 
-## Feature list
+**LoRA-Dataset-Forge compresses that into an afternoon.** Drop a face shot and a body shot of each character into a folder, hit Generate, come back to a clean, captioned, aspect-bucketed, identity-locked training corpus that drops straight into musubi-tuner, ai-toolkit, or kohya.
 
-- **Multi-character batch processing** — auto-scans a dataset root for subfolders, detects face/body images by filename keywords
-- **Parallel generation** — configurable worker pool (default 4, cap 8) for 4× wall-time speedup
-- **Refusal detection** — distinguishes Gemini safety refusals from transient errors; refusals skip cleanly instead of burning retries
-- **Per-character distribution control** — explicit bucket split (e.g. 10 close-ups + 10 full-body + 10 random for a 30-image set)
-- **Resumable** — manifest-driven state; interrupted batches pick up where they left off
-- **Auto-save** — every setting change persists to `_settings.json` (debounced 400 ms). API key save is opt-in via a `remember` toggle
-- **Vision-model caption verification (optional)** — re-captions each generated image based on what's actually visible (fixes prompt-vs-output drift)
-- **Face similarity validation (optional)** — Gemini-as-judge scores each generated image against the face reference; auto-flag low scorers in the review grid
-- **Cost estimator** — live dollar estimate before you hit Generate
-- **Prompt preview** — eyeball the system prompt, spec, and rendered prompt/caption for any character before committing
-- **Trainer config export** — one click produces configs for musubi-tuner and ai-toolkit
-- **Dark UI** with Windows 11 native dark titlebar
+---
 
-## Requirements
+## What you get
 
-- Python 3.10+
-- A Google Gemini API key ([get one](https://aistudio.google.com/apikey))
-- ~2-5 GB of disk per character for 2K output (at the default 30 images/char)
+- **Dual-reference identity lock** — face + body references sent on every call, so the same person appears in every image
+- **4+ billion unique specs** — framing × angle × expression × pose × lighting × environment × weather × prop × outfit, deterministic per character
+- **Smart aspect ratios** — 3:4 close-ups, 4:5 mid-shots, 2:3 three-quarter body, 9:16 full-body. Qwen-Image's native buckets, no letterboxing
+- **Qwen-native captions** — single-line natural language, trigger word first, auto-written to `.txt` sidecars. Optional vision-model re-captioning so captions match what actually got generated (not just what we asked for)
+- **Review grid with face validation** — thumbnail wall, click to reject, Gemini-judge scores each image against your face reference, auto-flag low scorers
+- **Per-character distribution control** — split 30 images into "10 close-ups + 10 full-body + 10 random" with one click; the forge remembers and refills rejected slots with guaranteed-unused specs
+- **Parallel workers** — 4-way default, capped at 8. 700 images in ~15 minutes instead of an hour
+- **Live cost estimator** — knows what it'll cost before you hit Generate
+- **Auto-save** — every setting persists across sessions. API key opt-in
+- **One-click trainer config export** — `_musubi_config.toml`, `_aitoolkit_config.yaml`, and a training README with the exact launch command
+- **Dark UI** that isn't an eyesore, on Windows 11 with a dark titlebar to match
+
+---
+
+## The pipeline
+
+```
+    face.jpg      body.jpg         48 framings × 10 angles × 14 expressions
+        \           /                × 18 lightings × 52 scenes × 36 props
+         \         /                 × 10 weathers × 32 outfits
+          \       /                      (~4 billion specs, deterministic
+           v     v                        per character trigger word)
+        ┌───────────┐                            │
+        │           │<───────────────────────────┘
+        │   forge   │
+        │           │ system prompt: identity lock,
+        └─────┬─────┘ anatomy rules, anti-AI-gloss
+              │
+              │ parallel worker pool (x4)
+              ▼
+     ┌──────────────────┐
+     │  Nano Banana 2   │  gemini-3.1-flash-image-preview
+     │  (Gemini Image)  │  at 2K, smart aspect per framing
+     └────────┬─────────┘
+              │
+              ▼                                 ┌───────────┐
+     ┌──────────────────┐   optional hop to    │ gemini-2.5 │
+     │  generated image │──────────────────────>│  -flash    │
+     │                  │    (re-caption,       │ (vision    │
+     └────────┬─────────┘     validate face)    │  judge)    │
+              │                                 └─────┬─────┘
+              ▼                                       │
+     ┌──────────────────┐                             │
+     │  NNN.png +       │<────────────────────────────┘
+     │  NNN.txt         │
+     │  (+ manifest.json│
+     │   with category, │
+     │   score, flat id)│
+     └────────┬─────────┘
+              │
+              │ export train configs
+              ▼
+     ┌──────────────────┐
+     │  musubi-tuner    │  or ai-toolkit, kohya, OneTrainer
+     │  Qwen-Image LoRA │
+     └──────────────────┘
+```
+
+---
 
 ## Install
 
@@ -44,13 +88,10 @@ Point it at a folder of characters (one subfolder per character, each containing
 
 ```cmd
 install.bat
-```
-
-This creates a local `.venv` and installs dependencies. Then:
-
-```cmd
 run.bat
 ```
+
+That's it. `install.bat` creates a local `.venv` and installs the two dependencies; `run.bat` launches the app.
 
 ### macOS / Linux
 
@@ -64,105 +105,166 @@ chmod +x install.sh run.sh
 
 ```bash
 python -m venv .venv
-.venv/bin/pip install -r requirements.txt    # or .venv\Scripts\pip on Windows
+.venv/bin/pip install -r requirements.txt   # Windows: .venv\Scripts\pip
 .venv/bin/python forge.py
 ```
 
+Needs Python 3.10+. Dependencies are `google-genai` and `Pillow` — nothing else.
+
+---
+
 ## Setup
 
-1. **Get an API key** at <https://aistudio.google.com/apikey> (free tier available, paid gets faster + higher rate limits)
-2. **Set `GEMINI_API_KEY`** as an environment variable, or paste it into the app's API KEY field
-3. **Prepare your dataset root** — one subfolder per character:
+**1. Get a Gemini API key** at <https://aistudio.google.com/apikey>. Free tier works; paid tier is faster and has higher rate limits.
 
-   ```
-   My Characters/
-     Alice/
-       alice_face.jpg      ← face closeup
-       alice_body.jpg      ← full-body shot
-     Bob/
-       bob_portrait.jpg
-       bob_fullbody.jpg
-     ...
-   ```
+**2. Either** export it as `GEMINI_API_KEY` **or** paste it into the `API KEY` field in the app. If you want it remembered across sessions, flip the `remember` toggle next to the field (off by default for safety).
 
-   Face/body detection looks for keywords in filenames (`face`, `portrait`, `closeup` → face; `body`, `full`, `pose` → body). If your filenames don't contain those, use the `edit` button next to each image slot in the GUI.
+**3. Organize your dataset root** as one subfolder per character, each containing a face shot and a body shot:
 
-## Using the tool
-
-1. Launch → the app auto-scans your dataset root and lists each character as a row.
-2. (Optional) Click `dist` on a character to set a custom distribution like "10 close + 10 full + 10 random".
-3. Set a resolution (2K recommended for Qwen-Image LoRA), aspect mode (leave on "smart"), and workers count.
-4. Optionally enable **verify captions** if you want vision-model re-captioning.
-5. Click **GENERATE**. Watch the log, per-character progress, and cost estimator.
-6. When it's done, click **review** on any character to:
-   - Inspect all generated images in a thumbnail grid
-   - Click any thumbnail to reject it (red border)
-   - Click **validate** to score each image's face similarity to the reference
-   - Click **flag low scores** to auto-reject anything below 0.60
-   - Click **apply & close** to delete rejected files
-7. Hit **GENERATE** again to refill the rejected slots with fresh combinatorial specs (no repeats).
-8. Click **export train configs** to generate `_musubi_config.toml`, `_aitoolkit_config.yaml`, and `_training_README.md`.
-
-## Training the LoRA
-
-The exported `_training_README.md` has full launch commands for both `musubi-tuner` (recommended for Qwen-Image) and `ai-toolkit`. Basic musubi flow:
-
-```bash
-accelerate launch --num_cpu_threads_per_process 1 qwen_image_train_network.py \
-    --dataset_config "_musubi_config.toml" \
-    --output_dir ./outputs \
-    --output_name my_lora \
-    --save_model_as safetensors \
-    --network_module networks.lora_qwen_image \
-    --network_dim 16 --network_alpha 16 \
-    --learning_rate 1e-4 --max_train_epochs 10 \
-    --mixed_precision bf16
 ```
+My LoRA Dataset/
+├── Anna/
+│   ├── anna_face.jpg      (close-up, just the face)
+│   └── anna_body.jpg      (full body, well-lit)
+├── Bob/
+│   ├── bob_portrait.jpg
+│   └── bob_fullbody.jpg
+└── ...
+```
+
+The forge auto-detects which is face vs body by filename keywords (`face`, `portrait`, `closeup`, `head` → face; `body`, `full`, `pose` → body). If your files don't contain those keywords, use the `edit` button next to each picker in the GUI.
+
+---
+
+## Quickstart
+
+```
+ 1. launch → app scans your dataset root, lists each character as a row
+ 2. pick your model (Nano Banana 2 = fast, Pro = higher fidelity at 3x cost)
+ 3. (optional) click 'dist' on any character to set a custom framing mix
+ 4. hit GENERATE — watch the cost estimator, progress bar, and log
+ 5. when it finishes, click 'review' on a character
+ 6. click 'validate' → Gemini scores each image's face-match
+ 7. click 'flag low scores' → auto-rejects anything below the threshold
+ 8. click 'apply & close' → deletes rejected files
+ 9. hit GENERATE again → refills the gaps with guaranteed-unused specs
+10. click 'export train configs' → drops musubi-tuner + ai-toolkit configs
+    into your output folder, with the exact training command
+```
+
+That's the whole pipeline. Five minutes of clicking, an afternoon of waiting, one clean LoRA-ready dataset per character.
+
+---
+
+## Feature deep-dive
+
+### Dual-reference identity lock
+Every API call sends **both** your face and body references, flanked by a system prompt that's tuned hard for identity preservation (bone structure, eye shape, hair, skin tone, body proportions). Nano Banana 2 was specifically trained for multi-image conditioning and handles this better than any single-reference approach. Identity drift is rare and mostly catchable in the review pass.
+
+### The combinatorial engine
+Instead of recycling a small pool of prompts, the forge samples from the Cartesian product of 9 independent axes. That gives roughly 4 billion unique specs — at any count up to 500 (or higher), every image has a unique spec. Sampling is deterministic per character trigger word, so re-running with a larger count extends the prior sequence instead of reshuffling it.
+
+### Smart aspect ratios
+Close-ups at 3:4 keep face pixel density high. Mid-shots at 4:5 don't square-crop the shoulders. Full-body at 9:16 gives tall subjects actual vertical real estate. Qwen-Image buckets natively at all of these, so the trainer sees clean crops instead of letterboxed junk.
+
+### Review + validate + regenerate
+The review window is a clickable thumbnail wall. `validate` spins up a Gemini vision judge (`gemini-2.5-flash`) that rates each image's face similarity against your reference on a 0.00-1.00 scale, with one-sentence reasons logged into the manifest. `flag low scores` bulk-rejects anything below 0.60. `apply & close` deletes rejected files. Then the main Generate button fills the gaps with **guaranteed-unused** combinatorial specs — the manifest tracks every flat-index ever used, so regen never repeats a rejected spec.
+
+### Per-character distribution
+Click `dist` on any row. Four spinboxes: close, mid, full, random. Set `10·0·10·10` and you get slots 1-10 as close-ups, 11-20 as full-body, 21-30 as random. Category is recorded per slot in the manifest, so changing the distribution later doesn't silently reshuffle existing slots — refills still respect the original category.
+
+### Trainer config export
+Click `export train configs`. Drops three files into the output directory:
+
+- `_musubi_config.toml` — ready-to-use for musubi-tuner's `--dataset_config`
+- `_aitoolkit_config.yaml` — the `datasets:` block to merge into your training YAML
+- `_training_README.md` — the full `accelerate launch` command with sensible defaults (LoRA rank 16, 10 epochs, bf16)
+
+No guessing at bucketing settings, no hunting for the right arguments.
+
+---
 
 ## Configuration
 
-All settings persist automatically to `_settings.json` (which is gitignored — do not commit it).
+All settings auto-save to `_settings.json` next to the tool (gitignored — don't commit it).
 
-| Setting | Default | Notes |
+| Setting | Default | What it controls |
 |---|---|---|
-| Model | `gemini-3.1-flash-image-preview` | Nano Banana 2. Switch to `gemini-3-pro-image-preview` for higher fidelity at 4× cost. |
-| Resolution | `2K` | Sweet spot for Qwen-Image's 1328px native res. |
-| Aspect mode | `smart (per framing)` | 3:4 close / 4:5 mid / 2:3 3/4-body / 9:16 full-body / 2:3 full-wide. |
-| Workers | `4` | Parallel API calls per character. Safe up to 8 on paid Gemini tiers. |
-| Verify captions | off | Enable to re-caption each image via a vision model. Adds ~1s per image, ~$0.0001 per call. |
-| Remember API key | off | When off, the key is kept in memory only. Turn on only if you're the sole user of your machine. |
+| Model | `gemini-3.1-flash-image-preview` | Nano Banana 2. Switch to Pro for higher fidelity at ~3× cost. |
+| Resolution | `2K` | Sweet spot for Qwen-Image's 1328px native resolution. |
+| Aspect mode | `smart (per framing)` | 3:4 close / 4:5 mid / 2:3 3/4-body / 9:16 full-body. |
+| Workers | `4` | Parallel API calls per character. Safe up to 8. |
+| Verify captions | off | Re-caption each image via vision model. +~$0.0001 / image. |
+| Remember API key | off | Off = memory-only for this session. On = saved to disk. |
+| Default count | `30` | Applied to all characters via the "apply to all" button. |
+
+---
 
 ## Cost
 
-Very rough per-image USD (Nano Banana 2 at 2K): **~$0.039**. A typical 30-image character set is ~$1.20. A 7-character × 30-image production run lands around **$8-10**.
+Rough per-image numbers for Nano Banana 2 at 2K:
 
-Pro model is roughly 3× more. See the live cost estimator in the app.
+| dataset | cost |
+|---|---|
+| 30 images (one character) | ~$1.20 |
+| 210 images (7 characters × 30) | ~$8.20 |
+| 700 images (7 × 100) | ~$27 |
+| Same 700 with `verify captions` on | ~$27.10 |
 
-## Security notes
+Nano Banana Pro is roughly 3× more per image — worth it for a final polish pass, overkill for prototyping. See the live cost estimator in the app for the actual number on your current batch.
 
-- `_settings.json` contains your API key (when "remember" is enabled) and local paths. **Do not commit it.** The bundled `.gitignore` excludes it.
-- The tool makes outbound calls only to Gemini's API. No telemetry, no third-party analytics.
-- Face validation and caption verification reuse the same API key.
+---
 
-## Tips
+## Tips, gotchas, and honest advice
 
-- **Start with one character at low count** (5-10 images) to sanity-check your references and prompt before burning budget on the full batch.
-- **If your dataset root is inside OneDrive/Dropbox**, move it to a local folder first — sync locks can cause intermittent `PermissionError` during generation. The app shows an amber warning banner when it detects OneDrive in the path.
-- **Face validation cost is negligible** (~$0.01 for a 100-image pass) but adds ~30s wall time. Run it before rejecting manually — the auto-flag often catches identity drift you'd have missed.
-- **If you're training a character LoRA that needs wardrobe flexibility at inference time**, enable `vary outfit` per character (cycles through 32 outfits). If you want the LoRA to bake in the reference outfit, leave it off.
-- **For characters with a specific body type** (tall, plus-size, petite), the body reference does most of the work — make sure it's a clean, well-framed full-body shot.
+- **Don't put your dataset root inside OneDrive or Dropbox.** Sync locks will cause intermittent `PermissionError` during generation. The app shows an amber warning banner when it detects this. Use a local path like `C:/LoRA-Datasets/`.
+- **Start with one character at count=5** to sanity-check your references before committing budget to the full batch. The forge's resume logic means a small test run isn't wasted — bump the count later and it extends the sequence.
+- **Face validation is cheap.** ~$0.01 for a 100-image pass. Run it before rejecting manually — it catches identity drift you'd miss on a first visual scan.
+- **Toggle `vary outfit` on** if you want inference-time wardrobe flexibility — the LoRA will learn the character decoupled from clothes, letting you prompt "ck_alice in a kimono" afterward. Leave it **off** if you want the reference outfit baked into the character identity (simpler prompting, less flexibility).
+- **Watch the cost estimator** when switching models. Pro at 4K for 700 images is real money; nothing about the UX prevents you from clicking yourself into a $60 invoice.
+- **Refusals happen.** Some framings or backgrounds trigger Gemini safety filters. The forge detects and skips these cleanly without wasting retries — they show up as `REFUSED` lines in the log and get marked in the manifest. Hit Generate again to refill the gap with a different spec.
 
-## Known limitations
+---
 
-- **Nano Banana house style:** every generated image carries subtle Gemini 3.1 Flash aesthetic artifacts (mild over-saturation, specific skin-smoothing). Your LoRA will learn those alongside the character. To mitigate, mix 20-30% real photos if you have them, use the Pro model, or add light noise/grain in post.
-- **Gemini pricing changes:** the cost estimator uses approximate rates. Check <https://ai.google.dev/pricing> for current numbers.
-- **OneDrive compatibility:** generation works but sync can lock files at inopportune moments. Local paths are strongly recommended.
-- **Windows-first:** developed and tested on Windows 11. macOS/Linux scripts included but less battle-tested — report issues.
+## Known limits
+
+**Nano Banana house style bakes in.** Every generated image carries subtle Gemini 3.1 Flash aesthetic signatures (mild over-saturation, specific skin-smoothing, particular catchlight rendering). Your LoRA will learn those alongside the character. Mitigations: mix in 20-30% real photos if you have them, use the Pro model, add light noise/grain in post, or accept it as the cost of synthetic data.
+
+**Face validation is a heuristic, not an oracle.** Gemini-as-judge is good enough to catch obvious identity drift but it's not InsightFace cosine similarity. Plan B (local InsightFace integration) is on the roadmap.
+
+**Gemini pricing changes.** The cost estimator uses approximate rates. Check <https://ai.google.dev/pricing> for current numbers.
+
+**Windows-first.** Developed and tested on Windows 11. macOS/Linux scripts are included but less battle-tested. File bug reports if something breaks.
+
+---
 
 ## Contributing
 
-Pull requests welcome. The codebase is two files: [`forge.py`](forge.py) (GUI + engine + workflow) and [`prompts.py`](prompts.py) (prompt library and sampling logic). Adding more scenes, outfits, props, or lighting setups to the pools in `prompts.py` is the easiest way to improve output diversity.
+Codebase is two files:
+
+- **[forge.py](forge.py)** — GUI, engine, workers, manifest, review, distribution editor, settings, export
+- **[prompts.py](prompts.py)** — prompt library, combinatorial sampling, framing categories, caption renderer
+
+The easiest high-impact contribution is adding entries to the axis pools in `prompts.py`:
+
+```python
+FRAMINGS = [...]       # 10 entries → add a "detail shot of hands" and it ripples
+SCENES = [...]         # 52 entries → add a ski slope or a subway car
+OUTFITS = [...]        # 32 entries → add a wedding dress or a winter coat
+PROPS = [...]          # 36 entries → add a skateboard or a vintage camera
+LIGHTINGS = [...]      # 18 entries → add a neon sign or a fireplace glow
+```
+
+Each new entry multiplies variety for every character. Pull requests welcome.
+
+If you want to go deeper, the [docs/audit.md](docs/audit.md) and [docs/fix-plan.md](docs/fix-plan.md) files document the architecture review from the last release pass — a good map of the codebase.
+
+---
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE). Use it, fork it, ship your own thing on top of it. The only ask is that you keep the license notice.
+
+---
+
+<sub>Built for characters who deserve consistent rendering.</sub>
