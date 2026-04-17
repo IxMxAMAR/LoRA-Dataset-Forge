@@ -1,0 +1,29 @@
+# User settings (contains API key + local paths)
+_settings.json
+_settings.json.tmp
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Generated datasets (per-user output)
+_dataset_output/
+**/_dataset_output/
+**/_manifest.json
+**/_manifest.json.tmp
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
