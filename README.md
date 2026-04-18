@@ -39,7 +39,7 @@ A photoshoot is expensive and inconsistent. Stable-diffusion-scraped photos drif
 ## The pipeline
 
 ```
-    face.jpg      body.jpg         48 framings × 10 angles × 14 expressions
+    face.jpg      body.jpg         10 framings × 10 angles × 14 expressions
         \           /                × 18 lightings × 52 scenes × 36 props
          \         /                 × 10 weathers × 32 outfits
           \       /                      (~4 billion specs, deterministic

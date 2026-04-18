@@ -19,7 +19,7 @@ import sys
 import tempfile
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -436,15 +436,37 @@ def _pick(images: list[Path], keywords: tuple[str, ...]) -> Optional[Path]:
     return None
 
 
+_UNSAFE_NAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def _sanitize_char_name(raw: str) -> str:
+    """Return a character name safe to use as a filesystem path component.
+    Strips path separators, leading dots, illegal Windows chars, and the
+    legacy ' retouch' suffix. Returns empty string if nothing usable remains.
+    """
+    clean = raw.replace(" retouch", "").strip()
+    clean = clean.strip(". ")  # no leading dots/spaces → no ".." or hidden files
+    clean = _UNSAFE_NAME_CHARS.sub("", clean)
+    return clean
+
+
 def scan_characters(root: Path) -> tuple[list[Character], list[str]]:
     """Scan `root` for character subfolders.
 
     Returns (characters, skipped_warnings). Inaccessible subfolders are skipped
-    with a warning rather than crashing the scan.
+    with a warning rather than crashing the scan. Character names are sanitized
+    to prevent path traversal attacks, and case-insensitive duplicates are
+    filtered (NTFS / macOS default FS both case-fold).
     """
     chars: list[Character] = []
     warnings: list[str] = []
+    seen_casefolded: set[str] = set()
     if not root.exists():
+        return chars, warnings
+    try:
+        root_resolved = root.resolve()
+    except OSError as e:
+        warnings.append(f"cannot resolve dataset root ({e})")
         return chars, warnings
     try:
         subdirs = sorted(root.iterdir())
@@ -459,15 +481,34 @@ def scan_characters(root: Path) -> tuple[list[Character], list[str]]:
                 continue
             if sub.name == "__MACOSX":
                 continue
+            # Path-traversal guard: the resolved path must stay under root
+            try:
+                sub_resolved = sub.resolve()
+                sub_resolved.relative_to(root_resolved)
+            except (ValueError, OSError):
+                warnings.append(f"skipped {sub.name!r}: path escapes dataset root")
+                continue
             imgs = sorted(p for p in sub.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS)
         except (PermissionError, OSError) as e:
             warnings.append(f"skipped {sub.name!r}: {e}")
             continue
         if not imgs:
             continue
+
+        clean = _sanitize_char_name(sub.name)
+        if not clean:
+            warnings.append(f"skipped {sub.name!r}: name has no safe characters")
+            continue
+
+        # Case-insensitive duplicate detection (NTFS / APFS default both case-fold)
+        folded = clean.casefold()
+        if folded in seen_casefolded:
+            warnings.append(f"skipped {sub.name!r}: case-insensitive duplicate of an earlier character")
+            continue
+        seen_casefolded.add(folded)
+
         face = _pick(imgs, FACE_KEYWORDS) or imgs[0]
         body = _pick(imgs, BODY_KEYWORDS) or (imgs[1] if len(imgs) > 1 else imgs[0])
-        clean = sub.name.replace(" retouch", "").strip()
         chars.append(Character(
             name=clean,
             folder=sub,
@@ -1996,7 +2037,7 @@ class PromptPreviewWindow:
         if self.char.distribution:
             tk.Label(
                 inner,
-                text=(f"this character uses a custom distribution: "
+                text=("this character uses a custom distribution: "
                       + ", ".join(f"{cat}={self.char.distribution.get(cat, 0)}"
                                   for cat in P.CATEGORY_ORDER
                                   if self.char.distribution.get(cat, 0))),
@@ -2053,9 +2094,8 @@ class PromptPreviewWindow:
                      font=(FONT_MONO, 10, "bold"), anchor="w").pack(side="left")
 
         # Distribution summary
-        total = sum(dist.values())
         summary = "  ·  ".join(f"{asp} ≈ {n*10}%" for asp, n in sorted(dist.items(), key=lambda x: -x[1]))
-        tk.Label(parent, text=f"distribution over 10 framings:  {summary}",
+        tk.Label(parent, text=f"distribution over {len(P.FRAMINGS)} framings:  {summary}",
                  bg=COLOR["surface"], fg=COLOR["muted"],
                  font=(FONT_UI, 9, "italic")).pack(anchor="w", padx=22, pady=(0, 6))
 
@@ -2118,9 +2158,27 @@ class PromptPreviewWindow:
 # -------------------------------------------------------------------------
 
 def export_trainer_configs(chars: list[Character], output_dir: Path):
-    """Generate musubi-tuner TOML, ai-toolkit YAML, and a README in output_dir."""
+    """Generate ai-toolkit YAML (primary target), musubi-tuner TOML (alternate),
+    and a training README in output_dir.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # ---- ai-toolkit (primary) ----
+    # Schema verified against ostris/ai-toolkit main branch
+    # config/examples/train_lora_qwen_image_24gb.yaml:
+    #   resolution is a LIST for multi-res bucketing (not a scalar, not [1024])
+    #   caption_ext is "txt" (no dot)
+    yaml_lines = [
+        "# ai-toolkit dataset section for Qwen-Image LoRA training",
+        "# generated by LoRA-Dataset-Forge",
+        "#",
+        "# Merge the 'datasets:' block below into your main ai-toolkit training",
+        "# YAML (start from config/examples/train_lora_qwen_image_24gb.yaml).",
+        "",
+        "datasets:",
+    ]
+
+    # ---- musubi-tuner (alternate) ----
     toml_lines = [
         "# musubi-tuner dataset config for Qwen-Image LoRA",
         "# generated by LoRA-Dataset-Forge",
@@ -2133,13 +2191,7 @@ def export_trainer_configs(chars: list[Character], output_dir: Path):
         "bucket_no_upscale = false",
         "",
     ]
-    yaml_lines = [
-        "# ai-toolkit dataset section for Qwen-Image LoRA",
-        "# generated by LoRA-Dataset-Forge",
-        "# merge the 'datasets:' key below into your main ai-toolkit config",
-        "",
-        "datasets:",
-    ]
+
     readme_lines = [
         "# LoRA Training — Dataset Ready",
         "",
@@ -2152,68 +2204,105 @@ def export_trainer_configs(chars: list[Character], output_dir: Path):
 
     for char in chars:
         char_dir = (output_dir / char.name).resolve()
-        toml_path = char_dir.as_posix()
-        toml_lines += [
-            "[[datasets]]",
-            f'image_directory = "{toml_path}"',
-            f'caption_extension = ".txt"',
-            f'num_repeats = 2',
+        char_path = char_dir.as_posix()
+        yaml_lines += [
+            f'  - folder_path: "{char_path}"',
+            '    caption_ext: "txt"',
+            '    caption_dropout_rate: 0.05',
+            '    shuffle_tokens: false',
+            '    cache_latents_to_disk: true',
+            '    resolution: [ 512, 768, 1024 ]',
             "",
         ]
-        yaml_lines += [
-            f'  - folder_path: "{toml_path}"',
-            f'    caption_ext: "txt"',
-            f'    caption_dropout_rate: 0.05',
-            f'    shuffle_tokens: false',
-            f'    cache_latents_to_disk: true',
-            f'    resolution: [1024]',
+        toml_lines += [
+            "[[datasets]]",
+            f'image_directory = "{char_path}"',
+            'caption_extension = ".txt"',
+            'num_repeats = 2',
             "",
         ]
         readme_lines.append(f"- **{char.name}** → `{char.trigger}`  ({char_dir})")
 
     readme_lines += [
         "",
-        "## musubi-tuner (recommended for Qwen-Image)",
-        "",
-        "1. Install musubi-tuner: <https://github.com/kohya-ss/musubi-tuner>",
-        "2. Use the generated `_musubi_config.toml` as your `--dataset_config`",
-        "3. Cache latents + text encoder outputs (per musubi docs), then:",
-        "",
-        "```bash",
-        "accelerate launch --num_cpu_threads_per_process 1 qwen_image_train_network.py \\",
-        '    --dataset_config "_musubi_config.toml" \\',
-        "    --output_dir ./outputs \\",
-        "    --output_name my_lora \\",
-        "    --save_model_as safetensors \\",
-        "    --network_module networks.lora_qwen_image \\",
-        "    --network_dim 16 --network_alpha 16 \\",
-        "    --learning_rate 1e-4 --max_train_epochs 10 \\",
-        "    --mixed_precision bf16",
-        "```",
-        "",
-        "## ai-toolkit (alternative)",
+        "## ai-toolkit by ostris (recommended)",
         "",
         "1. Install ai-toolkit: <https://github.com/ostris/ai-toolkit>",
-        "2. Merge `_aitoolkit_config.yaml`'s `datasets:` block into your training job YAML",
-        "3. Run: `python run.py your_training_job.yaml`",
+        "2. Start from the official Qwen-Image example config:",
+        "   `config/examples/train_lora_qwen_image_24gb.yaml`",
+        "3. Replace the `datasets:` block in that file with the block from",
+        "   the generated `_aitoolkit_config.yaml` (one entry per character).",
+        "4. Adjust `name`, `trigger_word`, `output_folder`, `steps`, `lr`, and",
+        "   `rank` at the top of the config to match your character.",
+        "5. Run:",
+        "",
+        "```bash",
+        "python run.py /path/to/your_training_config.yaml",
+        "```",
+        "",
+        "**Starting hyperparameters for a 30-image character LoRA (24GB VRAM):**",
+        "- `rank: 16` (network dim)",
+        "- `learning_rate: 1e-4`",
+        "- `steps: 2000-3000` (roughly equivalent to 10-15 epochs)",
+        "- `batch_size: 1`",
+        "- `gradient_accumulation: 1`",
+        "- `optimizer: adamw8bit`",
+        "- `dtype: bf16`",
+        "",
+        "**If you have 32GB VRAM (RTX 5090 / A6000 Ada / etc.):**",
+        "- `rank: 32` — richer identity capture",
+        "- `batch_size: 2` — faster iteration",
+        "- Keep `optimizer: adamw8bit` — stability outweighs the VRAM savings being moot",
+        "- Consider `resolution: [ 768, 1024, 1344 ]` — take advantage of the memory",
+        "  headroom to train at slightly higher resolutions",
+        "- `dtype: bf16` still recommended (fp16 can NaN on Qwen-Image)",
+        "",
+        "## musubi-tuner (alternate)",
+        "",
+        "1. Install musubi-tuner: <https://github.com/kohya-ss/musubi-tuner>",
+        "2. Docs: <https://github.com/kohya-ss/musubi-tuner/blob/main/docs/qwen_image.md>",
+        "3. Cache latents + text-encoder outputs (per musubi docs).",
+        "4. Run (replace the `path/to/...` placeholders with your model paths):",
+        "",
+        "```bash",
+        "accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 \\",
+        "    src/musubi_tuner/qwen_image_train_network.py \\",
+        "    --dit path/to/dit_model \\",
+        "    --vae path/to/vae_model \\",
+        "    --text_encoder path/to/text_encoder \\",
+        "    --model_version original \\",
+        '    --dataset_config "_musubi_config.toml" \\',
+        "    --sdpa --timestep_sampling shift \\",
+        "    --weighting_scheme none --discrete_flow_shift 2.2 \\",
+        "    --optimizer_type adamw8bit --learning_rate 5e-5 \\",
+        "    --gradient_checkpointing \\",
+        "    --max_data_loader_n_workers 2 --persistent_data_loader_workers \\",
+        "    --network_module networks.lora_qwen_image \\",
+        "    --network_dim 16 \\",
+        "    --max_train_epochs 16 --save_every_n_epochs 1 --seed 42 \\",
+        "    --output_dir ./outputs --output_name my_lora",
+        "```",
         "",
         "## Caption style",
         "",
-        "Captions are written in natural-language single-line format, trigger word first.",
-        "This matches what Qwen-Image expects. Each `.txt` sits next to its matching `.png`.",
+        "Captions are single-line natural language, trigger word first. Each `.txt`",
+        "sits next to its matching `.png`. This format works for both ai-toolkit and",
+        "musubi-tuner out of the box.",
         "",
         "## Tips",
         "",
-        "- Start with `num_repeats = 2` and 10 epochs. Increase repeats for smaller datasets.",
-        "- `network_dim 16` is a good starting LoRA rank for character identity.",
-        "- If you enabled 'vary outfit' in the Forge, the LoRA will learn the character",
-        "  decoupled from outfits — good for outfit prompting at inference.",
-        "- If you kept outfits locked, the LoRA will bake the outfit into the identity —",
-        "  simpler prompting but less wardrobe flexibility.",
+        "- If you enabled 'vary outfit' in the Forge, the LoRA learns the character",
+        "  decoupled from clothes — good for outfit prompting at inference time.",
+        "- If outfit was locked, the LoRA bakes the reference outfit into the identity —",
+        "  simpler prompting, less wardrobe flexibility.",
+        "- `rank 16` is a reasonable starting point for character identity. Bump to 32",
+        "  if the LoRA underfits, drop to 8 if it overfits or memorizes.",
+        "- For ai-toolkit: the `resolution: [ 512, 768, 1024 ]` multi-res bucket means",
+        "  training sees each image at all three scales — good for generalization.",
     ]
 
-    (output_dir / "_musubi_config.toml").write_text("\n".join(toml_lines), encoding="utf-8")
     (output_dir / "_aitoolkit_config.yaml").write_text("\n".join(yaml_lines), encoding="utf-8")
+    (output_dir / "_musubi_config.toml").write_text("\n".join(toml_lines), encoding="utf-8")
     (output_dir / "_training_README.md").write_text("\n".join(readme_lines), encoding="utf-8")
 
 
@@ -2994,6 +3083,12 @@ class ForgeApp:
             self._scan_and_populate()
 
     def _scan_and_populate(self):
+        if getattr(self, "_job_running", False):
+            messagebox.showinfo(
+                "busy",
+                "cannot rescan while a generation is running. stop first, then rescan.",
+            )
+            return
         for w in self.list_inner.winfo_children():
             w.destroy()
         self.rows.clear()
@@ -3057,10 +3152,24 @@ class ForgeApp:
             row.body_picker.set_path(Path(p))
 
     def _preview(self, row: CharRow):
+        # Dedup — if a preview window is already open for this char, lift it
+        # rather than opening another one (each holds ~20MB of ref thumbnails).
+        if not hasattr(self, "_preview_windows"):
+            self._preview_windows: dict[str, tk.Toplevel] = {}
+        existing = self._preview_windows.get(row.char.name)
+        if existing and existing.winfo_exists():
+            existing.lift()
+            existing.focus_set()
+            return
+
         win = tk.Toplevel(self.root)
         win.title(f"{row.char.name}  —  references")
         win.configure(bg=COLOR["bg"])
         apply_dark_titlebar(win)
+        self._preview_windows[row.char.name] = win
+        win.protocol("WM_DELETE_WINDOW",
+                     lambda n=row.char.name: self._close_preview(n))
+
         for label, path in [("face", row.face_picker.path), ("body", row.body_picker.path)]:
             col = tk.Frame(win, bg=COLOR["bg"])
             col.pack(side="left", padx=18, pady=18)
@@ -3077,6 +3186,14 @@ class ForgeApp:
                 lbl.pack()
             except Exception as e:
                 tk.Label(col, text=f"(err: {e})", bg=COLOR["bg"], fg=COLOR["err"]).pack()
+
+    def _close_preview(self, char_name: str):
+        win = self._preview_windows.pop(char_name, None)
+        if win is not None:
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
 
     # -------- auto-save --------
     def _bind_global_save_traces(self):
@@ -3475,7 +3592,7 @@ class ForgeApp:
                     self.pbar.configure(maximum=total_in_batch, value=0)
                 except tk.TclError:
                     pass
-            self._log(f"batch accepted — polling for results (Ctrl+stop to pause poll)", "ok")
+            self._log("batch accepted — polling for results (Ctrl+stop to pause poll)", "ok")
             self.status_var.set(f"batch submitted · 0/{total_in_batch}")
             root = Path(self.root_var.get())
             output_dir = root / DEFAULT_OUTPUT_SUBDIR
