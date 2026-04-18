@@ -1055,16 +1055,40 @@ def run_batch_poll(output_dir: Path, api_key: str, model: str,
         state_name = getattr(job.state, "name", str(job.state))
         elapsed = time.time() - start_time
 
-        msgq.put(ProgressMsg(kind="batch_status", text=f"{state_name} · {elapsed/60:.1f}min"))
+        # Progress stats if Google reports them (not always populated for image jobs)
+        stats = getattr(job, "completion_stats", None)
+        stats_str = ""
+        if stats is not None:
+            done = getattr(stats, "successful_count", None) or getattr(stats, "succeeded_count", None) or 0
+            failed = getattr(stats, "failed_count", None) or 0
+            total = getattr(stats, "total_count", None) or getattr(stats, "total_requests", None)
+            if total:
+                stats_str = f" · completed {done}/{total} (failed {failed})"
 
-        # Log every state transition, plus a periodic "still waiting" every 5 polls (~2.5min)
+        # Staleness check — if state is RUNNING but server hasn't updated in a while,
+        # Google's pipeline may not be progress-reporting. Flag it.
+        stale_str = ""
+        up = getattr(job, "update_time", None)
+        if up is not None and state_name == "JOB_STATE_RUNNING":
+            import datetime as _dt
+            now = _dt.datetime.now(_dt.timezone.utc)
+            try:
+                stale_sec = (now - up).total_seconds()
+                if stale_sec > 600:
+                    stale_str = f" · server silent {stale_sec/60:.0f}min"
+            except Exception:
+                pass
+
+        msgq.put(ProgressMsg(kind="batch_status",
+                             text=f"{state_name} · {elapsed/60:.1f}min{stats_str}"))
+
         if state_name != last_state:
             msgq.put(ProgressMsg(kind="log",
-                text=f"[batch] state={state_name} (poll #{poll_count}, {elapsed/60:.1f}min elapsed)"))
+                text=f"[batch] state={state_name} (poll #{poll_count}, {elapsed/60:.1f}min elapsed){stats_str}"))
             last_state = state_name
         elif poll_count % 5 == 0:
             msgq.put(ProgressMsg(kind="log",
-                text=f"[batch] still {state_name} (poll #{poll_count}, {elapsed/60:.1f}min elapsed)"))
+                text=f"[batch] still {state_name} (poll #{poll_count}, {elapsed/60:.1f}min elapsed){stats_str}{stale_str}"))
 
         # Nudge if PENDING for a long time — not a bug, just a slow queue
         if (state_name == "JOB_STATE_PENDING" and elapsed > 600 and not pending_note_shown):
@@ -1072,6 +1096,14 @@ def run_batch_poll(output_dir: Path, api_key: str, model: str,
                 text=("[batch] PENDING for 10+ minutes — this is Google's server-side queue, not a client bug. "
                       "New accounts, free tier, or peak-hour submissions can wait 10-60+ minutes before "
                       "flipping to RUNNING. The app can be closed and reopened; polling resumes.")))
+            pending_note_shown = True
+
+        # Separate nudge for RUNNING-but-silent: likely stuck, suggest cancel
+        if (state_name == "JOB_STATE_RUNNING" and stale_str and elapsed > 900 and not pending_note_shown):
+            msgq.put(ProgressMsg(kind="log",
+                text=(f"[batch] RUNNING but server hasn't updated in {stale_sec/60:.0f}min and no completion_stats. "
+                      f"This CAN indicate a wedged batch. Consider cancelling (via Python: "
+                      f"client.batches.cancel(name='{batch_name}')) and resubmitting.")))
             pending_note_shown = True
 
         if state_name in BATCH_COMPLETED_STATES:
