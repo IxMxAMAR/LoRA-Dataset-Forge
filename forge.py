@@ -3389,6 +3389,16 @@ class ForgeApp:
             saved = saved_chars.get(c.name)
             if isinstance(saved, dict):
                 self._apply_saved_char(c, saved)
+            # Final consistency: if a distribution is set, count MUST equal
+            # its sum. Otherwise count and dist silently disagree on load —
+            # e.g., settings says count=30 but manifest dist sums to 40. The
+            # distribution is the more specific signal, so it wins.
+            if c.distribution:
+                dist_sum = sum(
+                    v for v in c.distribution.values() if isinstance(v, (int, float))
+                )
+                if dist_sum > 0 and c.count != dist_sum:
+                    c.count = dist_sum
             self._log(f"  · {c.name}  →  face={c.face.name}, body={c.body.name}, trigger={c.trigger}"
                       + (f", dist={c.distribution}" if c.distribution else ""), "dim")
             row = CharRow(self.list_inner, c, i,
