@@ -565,6 +565,22 @@ class ProgressMsg:
 REF_JPEG_QUALITY = 92
 
 
+def _slot_file_complete(out_char: Path, slot: int, min_png_bytes: int = 1024) -> bool:
+    """Return True iff slot N's PNG and TXT are both present AND the PNG is
+    large enough to be a real image (not a 0-byte stub from a crashed write).
+    Tolerates OSError (TOCTOU races, transient permissions) by treating them
+    as "not complete" rather than crashing the outer loop.
+    """
+    img_path = out_char / f"{slot:03d}.png"
+    txt_path = out_char / f"{slot:03d}.txt"
+    try:
+        if not (img_path.exists() and txt_path.exists()):
+            return False
+        return img_path.stat().st_size > min_png_bytes
+    except OSError:
+        return False
+
+
 def _load_jpeg_bytes(path: Path, quality: int = REF_JPEG_QUALITY) -> bytes:
     """Load an image and re-encode as JPEG at `quality` with optimize + progressive.
     No resizing — dimensions are preserved. Returns raw JPEG bytes.
@@ -681,14 +697,8 @@ def run_job(chars, root, output_dir, api_key, model, image_size, aspect_mode,
 
         slots_to_fill = []
         for slot in range(1, total_count + 1):
-            img_path = out_char / f"{slot:03d}.png"
-            txt_path = out_char / f"{slot:03d}.txt"
-            # Treat 0-byte or tiny PNGs as incomplete (crash mid-write survives
-            # a naive existence check but the file is unusable).
-            if (img_path.exists() and txt_path.exists()
-                    and img_path.stat().st_size > 1024):
-                continue
-            slots_to_fill.append(slot)
+            if not _slot_file_complete(out_char, slot):
+                slots_to_fill.append(slot)
 
         used_flats = used_flats_in_manifest(manifest)
 
@@ -1019,9 +1029,8 @@ def build_batch_jsonl(engine: "GeminiEngine", chars: list, output_dir: Path,
             total_count = sum(char.distribution.values()) if char.distribution else char.count
             slots_to_fill = []
             for slot in range(1, total_count + 1):
-                if (out_char / f"{slot:03d}.png").exists() and (out_char / f"{slot:03d}.txt").exists():
-                    continue
-                slots_to_fill.append(slot)
+                if not _slot_file_complete(out_char, slot):
+                    slots_to_fill.append(slot)
 
             if not slots_to_fill:
                 msgq.put(ProgressMsg(kind="log",
@@ -1095,6 +1104,7 @@ def build_batch_jsonl(engine: "GeminiEngine", chars: list, output_dir: Path,
                     "slot": slot,
                     "flat": flat,
                     "category": category,
+                    "trigger": char.trigger,
                     "caption": caption,
                     "aspect": aspect,
                     "framing": spec["framing"],
@@ -1433,7 +1443,7 @@ def run_batch_poll(output_dir: Path, api_key: str, model: str,
 
         # Skip if a prior partially-processed resume already wrote this slot.
         # Preserves any validation scores or manual edits that happened since.
-        if out_img.exists() and out_txt.exists():
+        if _slot_file_complete(out_char, slot):
             already_present += 1
             continue
 
@@ -1465,10 +1475,12 @@ def run_batch_poll(output_dir: Path, api_key: str, model: str,
                 # If verify_captions was on at submit time, re-caption via vision
                 # model now using the actual generated image. This keeps batch
                 # mode behaviorally consistent with sync mode's verify toggle.
+                # Trigger is stored explicitly in key_map — don't parse from
+                # the templated caption (fragile: trigger could contain commas).
                 final_caption = caption
                 if state.get("verify_captions"):
                     try:
-                        trigger = info.get("caption", "").split(",", 1)[0].strip() or char_name
+                        trigger = info.get("trigger") or char_name
                         new_cap = engine.caption_image(img_bytes, trigger)
                         if new_cap and len(new_cap) > 20:
                             final_caption = new_cap
@@ -3509,7 +3521,8 @@ class ForgeApp:
             bad.append(f"trigger {t!r} shared by multiple characters ({', '.join(ns)}) — they would generate IDENTICAL datasets. Make each trigger unique.")
         if bad:
             messagebox.showerror("cannot start", "Fix these first:\n\n - " + "\n - ".join(bad))
-            self._job_running = False
+            # Note: _job_running is still False here (guard at the top of this
+            # method exits early if it was True), so no state to reset.
             return
 
         root = Path(self.root_var.get())
