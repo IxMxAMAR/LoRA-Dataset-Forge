@@ -781,6 +781,25 @@ def _b64(data: bytes) -> str:
     return base64.b64encode(data).decode("ascii")
 
 
+def _cleanup_ref_files(engine: "GeminiEngine", names: list[str]) -> int:
+    """Delete uploaded Files API entries. Safe to call with any mix of names.
+    Returns count successfully deleted. Silent on individual failures (Google
+    auto-expires at 48h anyway).
+    """
+    if not names or engine is None:
+        return 0
+    deleted = 0
+    for n in names:
+        if not n:
+            continue
+        try:
+            engine.client.files.delete(name=n)
+            deleted += 1
+        except Exception:
+            pass
+    return deleted
+
+
 def _wait_for_file_active(engine: "GeminiEngine", file_name: str,
                           timeout_s: int = 90) -> None:
     """Poll the Files API until a just-uploaded file is ACTIVE (ready for use).
@@ -879,7 +898,8 @@ def _build_batch_request_uri(spec, trigger, outfit, face_uri: str, body_uri: str
 
 def build_batch_jsonl(engine: "GeminiEngine", chars: list, output_dir: Path,
                       image_size: str, aspect_mode: str,
-                      msgq: "queue.Queue[ProgressMsg]") -> tuple[Path, dict, list[str]]:
+                      msgq: "queue.Queue[ProgressMsg]",
+                      stop_event: threading.Event) -> tuple[Path, dict, list[str]]:
     """Construct the JSONL file and a key_map that maps each request key
     back to (char_name, slot, flat, category).
 
@@ -900,6 +920,9 @@ def build_batch_jsonl(engine: "GeminiEngine", chars: list, output_dir: Path,
     written = 0
     try:
         for char in chars:
+            if stop_event.is_set():
+                msgq.put(ProgressMsg(kind="log", text="stop requested during batch prep — aborting"))
+                break
             out_char = output_dir / char.name
             out_char.mkdir(parents=True, exist_ok=True)
             manifest = load_manifest(out_char)
@@ -1032,16 +1055,42 @@ def run_batch_submit(chars: list, output_dir: Path, api_key: str, model: str,
         text=f"Preparing batch: {len(enabled)} character(s), "
              f"resolution={image_size}, aspect={aspect_mode}, model={model}"))
 
+    ref_file_names: list[str] = []
+    jsonl_path: Optional[Path] = None
     try:
         jsonl_path, key_map, ref_file_names = build_batch_jsonl(
-            engine, enabled, output_dir, image_size, aspect_mode, msgq)
+            engine, enabled, output_dir, image_size, aspect_mode, msgq, stop_event)
     except Exception as e:
         msgq.put(ProgressMsg(kind="error", text=f"Failed to build batch JSONL: {e}"))
+        # Clean up any refs that did upload before the failure
+        deleted = _cleanup_ref_files(engine, ref_file_names)
+        if deleted:
+            msgq.put(ProgressMsg(kind="log", text=f"cleaned up {deleted} orphaned ref upload(s)"))
         msgq.put(ProgressMsg(kind="done"))
         return
 
     if not key_map:
+        # No work to do — but refs may have been uploaded before the all-slots-present
+        # check in build_batch_jsonl. Clean them up or they leak until Google auto-expires.
+        deleted = _cleanup_ref_files(engine, ref_file_names)
+        if deleted:
+            msgq.put(ProgressMsg(kind="log", text=f"cleaned up {deleted} unused ref upload(s)"))
+        if jsonl_path and jsonl_path.exists():
+            try:
+                jsonl_path.unlink(missing_ok=True)
+            except Exception:
+                pass
         msgq.put(ProgressMsg(kind="log", text="Nothing to batch — all slots already filled."))
+        msgq.put(ProgressMsg(kind="done"))
+        return
+
+    if stop_event.is_set():
+        msgq.put(ProgressMsg(kind="log", text="stop requested before JSONL upload — aborting"))
+        _cleanup_ref_files(engine, ref_file_names)
+        try:
+            jsonl_path.unlink(missing_ok=True)
+        except Exception:
+            pass
         msgq.put(ProgressMsg(kind="done"))
         return
 
@@ -1051,6 +1100,7 @@ def run_batch_submit(chars: list, output_dir: Path, api_key: str, model: str,
              f"(refs uploaded separately via Files API)"))
 
     # Upload JSONL
+    uploaded = None
     try:
         msgq.put(ProgressMsg(kind="log", text=f"Uploading batch JSONL ({jsonl_path.stat().st_size:,} bytes)..."))
         types = engine._types
@@ -1058,11 +1108,12 @@ def run_batch_submit(chars: list, output_dir: Path, api_key: str, model: str,
             file=str(jsonl_path),
             config=types.UploadFileConfig(
                 display_name=f"forge_batch_{int(time.time())}",
-                mime_type="jsonl",
+                mime_type="application/x-ndjson",
             ),
         )
     except Exception as e:
         msgq.put(ProgressMsg(kind="error", text=f"File upload failed: {e}"))
+        _cleanup_ref_files(engine, ref_file_names)
         try:
             jsonl_path.unlink(missing_ok=True)
         except Exception:
@@ -1070,7 +1121,6 @@ def run_batch_submit(chars: list, output_dir: Path, api_key: str, model: str,
         msgq.put(ProgressMsg(kind="done"))
         return
     finally:
-        # Can remove local JSONL now that it's uploaded
         try:
             jsonl_path.unlink(missing_ok=True)
         except Exception:
@@ -1085,6 +1135,12 @@ def run_batch_submit(chars: list, output_dir: Path, api_key: str, model: str,
         )
     except Exception as e:
         msgq.put(ProgressMsg(kind="error", text=f"Batch submit failed: {e}"))
+        _cleanup_ref_files(engine, ref_file_names)
+        # Also delete the uploaded JSONL file on Google's side since batch never consumed it
+        try:
+            engine.client.files.delete(name=uploaded.name)
+        except Exception:
+            pass
         msgq.put(ProgressMsg(kind="done"))
         return
 
@@ -1226,33 +1282,44 @@ def run_batch_poll(output_dir: Path, api_key: str, model: str,
 
     if final_state != "JOB_STATE_SUCCEEDED":
         msgq.put(ProgressMsg(kind="error", text=f"Batch finished in state: {final_state}"))
+        # Still clean up any refs the submit left behind — batch isn't going to use them now.
+        _cleanup_ref_files(engine, state.get("ref_file_names") or [])
         clear_batch_state(output_dir)
         msgq.put(ProgressMsg(kind="done"))
         return
 
-    # Download results
+    # Download results to a temp file, then stream-read line by line.
+    # Avoids holding the full decoded result (500MB+ for a large batch) in memory alongside bytes.
+    result_temp: Optional[Path] = None
     try:
         result_file = job.dest.file_name if job.dest else None
         if not result_file:
             raise RuntimeError("no dest file on completed batch")
         msgq.put(ProgressMsg(kind="log", text=f"Downloading results from {result_file}..."))
         result_bytes = engine.client.files.download(file=result_file)
+        with tempfile.NamedTemporaryFile(
+            prefix="forge_result_", suffix=".jsonl", delete=False, mode="wb",
+        ) as tmpf:
+            tmpf.write(result_bytes)
+            result_temp = Path(tmpf.name)
+        del result_bytes  # free ~N00MB immediately
     except Exception as e:
         msgq.put(ProgressMsg(kind="error", text=f"Result download failed: {e}"))
         msgq.put(ProgressMsg(kind="done"))
         return
 
-    try:
-        text = result_bytes.decode("utf-8")
-    except Exception:
-        text = result_bytes.decode("utf-8", errors="replace")
-
     saved = 0
     refused = 0
     errors = 0
+    already_present = 0
     manifests: dict[str, dict] = {}  # char_name -> manifest dict
 
-    for line in text.splitlines():
+    def _iter_result_lines():
+        with open(result_temp, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                yield line
+
+    for line in _iter_result_lines():
         if not line.strip():
             continue
         try:
@@ -1277,6 +1344,12 @@ def run_batch_poll(output_dir: Path, api_key: str, model: str,
         # Lazily load per-char manifests for incremental updates
         if char_name not in manifests:
             manifests[char_name] = load_manifest(out_char)
+
+        # Skip if a prior partially-processed resume already wrote this slot.
+        # Preserves any validation scores or manual edits that happened since.
+        if out_img.exists() and out_txt.exists():
+            already_present += 1
+            continue
 
         resp = entry.get("response") or {}
         candidates = resp.get("candidates") or []
@@ -1328,16 +1401,23 @@ def run_batch_poll(output_dir: Path, api_key: str, model: str,
         except Exception as e:
             msgq.put(ProgressMsg(kind="error", text=f"manifest save failed for {char_name}: {e}"))
 
-    msgq.put(ProgressMsg(kind="log",
-        text=f"Batch complete — saved {saved}, refused {refused}, errors {errors}"))
+    summary = f"Batch complete — saved {saved}, refused {refused}, errors {errors}"
+    if already_present:
+        summary += f", skipped {already_present} (already present)"
+    msgq.put(ProgressMsg(kind="log", text=summary))
 
-    # Clean up any Files API uploads (refs + input JSONL) to keep the account tidy.
-    ref_files = state.get("ref_file_names") or []
-    for fname in ref_files:
+    # Clean up the temp result file we streamed from
+    if result_temp:
         try:
-            engine.client.files.delete(name=fname)
+            result_temp.unlink(missing_ok=True)
         except Exception:
-            pass  # Google auto-expires in 48h anyway
+            pass
+
+    # Clean up any Files API uploads (refs) to keep the account tidy.
+    # Google auto-expires in 48h regardless but tidy is better than littered.
+    deleted = _cleanup_ref_files(engine, state.get("ref_file_names") or [])
+    if deleted:
+        msgq.put(ProgressMsg(kind="log", text=f"cleaned up {deleted} Files API ref(s)"))
 
     clear_batch_state(output_dir)
     msgq.put(ProgressMsg(kind="done"))
@@ -3290,8 +3370,10 @@ class ForgeApp:
         if not api_key:
             self._log("[batch] no API key; cannot poll", "err")
             return
+        # Don't clear stop_event here — if a submit thread is still unwinding
+        # after a Stop press, clearing would silently re-enable it. The submit
+        # path clears stop_event in _start_job when the user clicks Generate.
         self._job_running = True
-        self.stop_event.clear()
         self.generate_btn.set_enabled(False)
         self.stop_btn.set_enabled(True)
         self.worker = threading.Thread(
@@ -3310,15 +3392,43 @@ class ForgeApp:
         if not state:
             return
         name = state.get("batch_name", "?")
-        total = state.get("total_requests", "?")
+        total = state.get("total_requests", 0)
         self._log(f"[batch] pending batch detected: {name} ({total} req)", "info")
-        if messagebox.askyesno(
+
+        # Pre-populate progress state so the status bar shows sensible counts
+        # when results start arriving, instead of "N/0" garbage.
+        try:
+            t = int(total)
+        except (ValueError, TypeError):
+            t = 0
+        if t > 0:
+            self._total_jobs = t
+            self._done_jobs = 0
+            self._char_done = {}
+            try:
+                self.pbar.configure(maximum=t, value=0)
+            except tk.TclError:
+                pass
+
+        if not messagebox.askyesno(
             "pending batch",
             f"a submitted batch is still waiting for results:\n\n"
             f"  {name}\n  {total} request(s)\n\n"
             f"resume polling now?",
         ):
-            self._spawn_batch_poll(output_dir)
+            return
+
+        # If no API key present, prompt the user to enter one and retry.
+        if not self.api_var.get().strip():
+            messagebox.showwarning(
+                "api key needed",
+                "enter your GEMINI_API_KEY in the config card, then "
+                "click GENERATE to trigger a resume (the tool will detect "
+                "the pending batch again).",
+            )
+            return
+
+        self._spawn_batch_poll(output_dir)
 
     # -------- log + polling --------
     _LOG_MAX_LINES = 2000
@@ -3351,9 +3461,22 @@ class ForgeApp:
 
     def _handle_msg(self, msg: ProgressMsg):
         if msg.kind == "batch_submitted":
-            # Kick off the polling thread automatically after submit.
+            # Re-align progress tracking with the actual batch size (which may
+            # be smaller than sum(char.count) if some slots were already present).
+            try:
+                total_in_batch = int(msg.current)
+            except (ValueError, TypeError):
+                total_in_batch = 0
+            if total_in_batch > 0:
+                self._total_jobs = total_in_batch
+                self._done_jobs = 0
+                self._char_done = {}
+                try:
+                    self.pbar.configure(maximum=total_in_batch, value=0)
+                except tk.TclError:
+                    pass
             self._log(f"batch accepted — polling for results (Ctrl+stop to pause poll)", "ok")
-            self.status_var.set(f"batch submitted · 0/{msg.current}")
+            self.status_var.set(f"batch submitted · 0/{total_in_batch}")
             root = Path(self.root_var.get())
             output_dir = root / DEFAULT_OUTPUT_SUBDIR
             self._spawn_batch_poll(output_dir)
