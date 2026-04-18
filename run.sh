@@ -14,9 +14,10 @@ else
     exit 1
 fi
 
-"$PY" -c "import google.genai, PIL" 2>/dev/null || {
-    echo "[info] Missing dependencies. Run install.sh, or:"
+"$PY" -c "import google.genai as g, PIL; assert hasattr(g, 'Client'), 'wrong SDK'" 2>/dev/null || {
+    echo "[info] Missing or wrong dependencies. Run install.sh, or:"
     echo "       $PY -m pip install -r requirements.txt"
+    echo "       (Requires google-genai, not the legacy google-generativeai.)"
     exit 1
 }
 

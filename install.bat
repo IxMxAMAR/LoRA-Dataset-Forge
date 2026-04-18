@@ -9,6 +9,15 @@ if errorlevel 1 (
     exit /b 1
 )
 
+REM Require Python 3.10+ — the code uses `from __future__ import annotations`
+REM and modern typing features that assume 3.10.
+python -c "import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)"
+if errorlevel 1 (
+    python -c "import sys; print('[error] Python 3.10+ required, found:', sys.version)"
+    pause
+    exit /b 1
+)
+
 if not exist ".venv" (
     echo [info] Creating virtual environment at .venv ...
     python -m venv .venv
