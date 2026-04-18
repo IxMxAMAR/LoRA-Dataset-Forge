@@ -2354,7 +2354,7 @@ def _aitoolkit_full_config(char: Character, char_dir: Path) -> str:
 # If you're on 24GB, drop `linear` + `linear_alpha` from 32 → 16 and
 # `batch_size` from 2 → 1.
 #
-# Run with:   python run.py _aitoolkit_{char.name}.yaml
+# Run with:   python run.py <path-to-this-file>/aitoolkit_{char.name}.yaml
 
 job: extension
 config:
@@ -2450,15 +2450,21 @@ def export_trainer_configs(chars: list[Character], output_dir: Path):
     ]
 
     # ---- ai-toolkit (primary) — one COMPLETE config per character ----
+    # Per-character configs land inside the character's own output folder
+    # (under a `Configs/` subdir) so everything for one character stays
+    # together: images, captions, manifest, training configs.
     generated_configs: list[str] = []
     for char in chars:
         char_dir = (output_dir / char.name).resolve()
         char_path = char_dir.as_posix()
+        configs_dir = char_dir / "Configs"
+        configs_dir.mkdir(parents=True, exist_ok=True)
 
         yaml_text = _aitoolkit_full_config(char, char_dir)
-        yaml_name = f"_aitoolkit_{char.name}.yaml"
-        (output_dir / yaml_name).write_text(yaml_text, encoding="utf-8")
-        generated_configs.append(yaml_name)
+        yaml_name = f"aitoolkit_{char.name}.yaml"
+        yaml_path = configs_dir / yaml_name
+        yaml_path.write_text(yaml_text, encoding="utf-8")
+        generated_configs.append(str(yaml_path.relative_to(output_dir)))
 
         # musubi block for this char
         toml_lines += [
@@ -2471,21 +2477,23 @@ def export_trainer_configs(chars: list[Character], output_dir: Path):
 
         readme_lines.append(
             f"- **{char.name}** → trigger `{char.trigger}` → "
-            f"config `{yaml_name}` ({char_dir})"
+            f"config `{char.name}/Configs/{yaml_name}`"
         )
 
     readme_lines += [
         "",
         "## ai-toolkit by ostris (recommended)",
         "",
+        "Per-character configs live inside each character's folder under",
+        "`Configs/aitoolkit_<char>.yaml` — everything about one character",
+        "(images, captions, manifest, training config) stays together.",
+        "",
         "1. Install ai-toolkit: <https://github.com/ostris/ai-toolkit>",
-        "2. Copy the generated `_aitoolkit_<char>.yaml` file(s) into your",
-        "   ai-toolkit repo (any location works; the `folder_path` in the",
-        "   YAML references this dataset dir by absolute path).",
-        "3. Run each character's config:",
+        "2. The generated YAML uses absolute paths so you can run it from",
+        "   anywhere. Just point ai-toolkit at the file:",
         "",
         "```bash",
-        f"python run.py _aitoolkit_{chars[0].name if chars else 'CharName'}.yaml",
+        f"python run.py \"{(output_dir / (chars[0].name if chars else 'CharName') / 'Configs' / ('aitoolkit_' + (chars[0].name if chars else 'CharName') + '.yaml')).as_posix()}\"",
         "```",
         "",
         "Each YAML is a complete, runnable config — no template merging needed.",
