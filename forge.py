@@ -781,11 +781,39 @@ def _b64(data: bytes) -> str:
     return base64.b64encode(data).decode("ascii")
 
 
+def _wait_for_file_active(engine: "GeminiEngine", file_name: str,
+                          timeout_s: int = 90) -> None:
+    """Poll the Files API until a just-uploaded file is ACTIVE (ready for use).
+    Referencing a PROCESSING file in a batch request can cause per-request
+    errors that still bill at batch rate — so we MUST wait before submitting.
+    Raises RuntimeError on FAILED, TimeoutError past timeout_s.
+    """
+    start = time.time()
+    while time.time() - start < timeout_s:
+        try:
+            f = engine.client.files.get(name=file_name)
+        except Exception:
+            time.sleep(1.5)
+            continue
+        state = getattr(f, "state", None)
+        state_name = getattr(state, "name", str(state)) if state else ""
+        if state_name == "ACTIVE":
+            return
+        if state_name == "FAILED":
+            err = getattr(f, "error", None)
+            raise RuntimeError(f"Files API reported FAILED for {file_name}: {err}")
+        time.sleep(1.5)
+    raise TimeoutError(f"file {file_name} never reached ACTIVE within {timeout_s}s")
+
+
 def _upload_ref_via_files_api(engine: "GeminiEngine", jpeg_bytes: bytes,
-                              display_name: str) -> str:
-    """Upload a ref to Google's Files API and return the file URI.
-    The uploaded file is referenced by URI from every request that needs it,
-    instead of embedding the bytes redundantly in each request.
+                              display_name: str) -> tuple[str, str]:
+    """Upload a ref to Google's Files API and return (uri, short_name).
+
+    `uri` is the full URL used in fileData.fileUri for model requests.
+    `short_name` is the 'files/abc123' form used for delete/get calls.
+    Blocks until the file reaches ACTIVE state — otherwise the batch could
+    reference a PROCESSING file and waste request budget on resolution errors.
     """
     types = engine._types
     # Files API requires a file path, not bytes — write to temp
@@ -802,13 +830,21 @@ def _upload_ref_via_files_api(engine: "GeminiEngine", jpeg_bytes: bytes,
                 mime_type="image/jpeg",
             ),
         )
-        # SDK returns a File object with .uri and .name
-        return uploaded.uri or uploaded.name
     finally:
         try:
             os.unlink(tmp.name)
         except Exception:
             pass
+
+    # Defensive: both .uri and .name populated on success.
+    short_name = uploaded.name or ""
+    uri = uploaded.uri or short_name
+    if not short_name or not uri:
+        raise RuntimeError(f"Files API upload returned empty identifier for {display_name}")
+
+    # BLOCK until ACTIVE — referencing a PROCESSING file would bill for errors.
+    _wait_for_file_active(engine, short_name)
+    return uri, short_name
 
 
 def _build_batch_request_uri(spec, trigger, outfit, face_uri: str, body_uri: str,
@@ -893,21 +929,21 @@ def build_batch_jsonl(engine: "GeminiEngine", chars: list, output_dir: Path,
                                      text=f"[{char.name}] failed to load refs: {e}"))
                 continue
 
-            # Upload refs once per char via Files API → get URIs for reuse
+            # Upload refs once per char via Files API → get URIs for reuse.
+            # _upload_ref_via_files_api returns (full_uri, "files/xxx" short_name)
+            # and blocks until each file reaches ACTIVE, so the batch never
+            # references a still-processing file.
             msgq.put(ProgressMsg(kind="log",
-                text=f"[{char.name}] uploading face ({len(face_bytes)/1024:.0f}KB) + body ({len(body_bytes)/1024:.0f}KB) to Files API..."))
+                text=f"[{char.name}] uploading face ({len(face_bytes)/1024:.0f}KB) + "
+                     f"body ({len(body_bytes)/1024:.0f}KB) to Files API..."))
             try:
-                face_uri = _upload_ref_via_files_api(
+                face_uri, face_name = _upload_ref_via_files_api(
                     engine, face_bytes, f"forge_{char.name}_face")
-                body_uri = _upload_ref_via_files_api(
+                body_uri, body_name = _upload_ref_via_files_api(
                     engine, body_bytes, f"forge_{char.name}_body")
-                # Track names so caller can clean up after batch completes
-                for uri in (face_uri, body_uri):
-                    # Extract "files/xxx" form if URI was a full URL
-                    if uri and "/files/" in uri:
-                        uploaded_names.append("files/" + uri.split("/files/")[-1])
-                    elif uri and uri.startswith("files/"):
-                        uploaded_names.append(uri)
+                uploaded_names.extend([face_name, body_name])
+                msgq.put(ProgressMsg(kind="log",
+                    text=f"[{char.name}] refs ACTIVE on Google — proceeding"))
             except Exception as e:
                 msgq.put(ProgressMsg(kind="error", char=char.name,
                                      text=f"[{char.name}] ref upload failed: {e}"))
