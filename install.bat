@@ -39,4 +39,5 @@ if errorlevel 1 (
 
 echo.
 echo [ok] Ready. Launch with: run.bat
+echo.
 pause
