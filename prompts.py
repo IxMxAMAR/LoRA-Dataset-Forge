@@ -23,8 +23,12 @@ IDENTITY LOCK (non-negotiable):
 VARIATION (what changes per image):
 - Pose, expression, framing, camera angle, lighting, environment, weather, props, and (when specified) outfit.
 
-COHERENCE RULE:
-- If the specified outfit and environment would be contextually incoherent (e.g. evening gown in a gym, winter coat on a beach), adapt the environment to suit the outfit rather than producing a nonsensical scene. Identity preservation takes precedence over strict environment fidelity.
+COHERENCE RULES (priority order when axes conflict):
+1. IDENTITY WINS. The face and body from the references must be preserved above all else.
+2. FRAMING WINS over pose. If the framing requests a full-body head-to-toe shot, the character is standing at full height with feet visible on the ground — regardless of what the "pose" description says.
+3. OUTFIT WINS over environment. If the outfit (evening gown, activewear, trench coat, etc.) doesn't fit the environment (gym, beach, yoga studio, bar), adapt the environment to suit the outfit rather than producing an incoherent image. Keep the environment's general mood and lighting; shift the specific setting to something the outfit fits naturally.
+4. OUTFIT WINS over weather. If the outfit doesn't match the weather (sundress in snow, trench coat on a hot sunny beach), prioritize the outfit and adjust weather/season accordingly.
+5. PHYSICAL POSSIBILITY WINS. If a pose already uses both hands and a prop also needs a hand, drop the prop. If a handheld prop would be cropped out of the framing, omit it.
 
 ANATOMY & QUALITY (non-negotiable):
 - Sharp focus on the face and eyes. Both eyes correctly rendered with accurate catchlights and pupils.
@@ -434,34 +438,96 @@ def plan_jobs(count, vary_outfit=False, trigger="default", exclude=None):
 # Prompt + caption rendering
 # ---------------------------------------------------------------------------
 
-# Poses where the character is NOT standing at full height. When a full-body
-# framing gets paired with one of these, the resulting image shows her seated
-# or kneeling — defeats the training signal for the character's actual height.
+# ---------------------------------------------------------------------------
+# Coherence layer — fix semantically nonsensical combinations at render time.
+#
+# The combinatorial sampler produces (framing, angle, expression, pose,
+# environment, lighting, prop, weather, outfit) tuples where any combination
+# is possible. Many combinations are physically impossible or semantically
+# incoherent: full-body framing with a seated pose, extreme close-up with a
+# handheld prop, hands-in-pockets pose with a mug to hold. Gemini can
+# sometimes resolve these but often produces training-useless images.
+#
+# This layer applies deterministic rewrites BEFORE prompt/caption rendering
+# so both the spec sent to Gemini AND the caption saved to disk reflect the
+# adapted (physically-possible) scene.
+# ---------------------------------------------------------------------------
+
 _NON_UPRIGHT_POSE_KEYWORDS = (
     "seated", "sitting", "kneeling", "curled", "lying", "reclining",
     "crouch", "crouched", "folded to one side",
 )
 
+# Poses where both hands are already occupied by the pose itself. A handheld
+# prop can't coexist (physical impossibility: only two hands).
+_HANDS_OCCUPIED_BY_POSE_KEYWORDS = (
+    "hands in pockets", "hands tucked", "arms crossed", "arms hugging",
+    "hands clasped", "hands wrapped around", "brushing hair",
+    "one hand in hair", "adjusting an earring", "adjusting a necklace",
+    "adjusting coat collar", "hand resting", "hand brushing",
+    "fingertips brushing", "hand gently resting", "one hand brushing",
+)
 
-def _adapt_spec_for_framing(spec: dict) -> dict:
-    """Return a spec (copy) with pose adapted if it'd contradict the framing.
+# Close-up framings that crop out anything held in the hands — a prop is
+# invisible anyway, and forcing Gemini to fit one creates awkward composition.
+_CLOSE_FRAMING_KEYWORDS = (
+    "extreme close", "tight close", "close-up portrait", "bust shot",
+)
 
-    Full-body framings require an upright pose to show the character's actual
-    height. If the scene's natural pose is seated/kneeling/etc., rewrite to
-    "standing upright" — environment is preserved so we still get scene
-    variety (standing in a café, standing in a library, etc.).
+# Props that specifically require a free hand to hold/carry/use.
+_HANDHELD_PROP_KEYWORDS = (
+    "holding", "carrying", "scrolling", "with sunglasses",
+    "hands wrapped around",
+)
 
-    Returns the original spec untouched if no adaptation is needed.
+
+def _adapt_spec_for_coherence(spec: dict) -> dict:
+    """Return a spec (copy) with physically-impossible or semantically
+    incoherent combinations rewritten. Preserves variety on axes that don't
+    conflict — if a rule fires it rewrites ONLY the conflicting fields.
+
+    Rules (in application order):
+      1. Full-body framing needs an upright pose. If the scene pose is
+         seated / kneeling / curled / lying, rewrite pose to "standing
+         upright at full height". Environment preserved for scene variety.
+      2. Close-up framings drop handheld props — the prop won't be visible
+         in the crop anyway and forcing it in creates cluttered composition.
+      3. Hands-already-occupied poses drop handheld props — physical
+         impossibility (two hands, both doing something else).
     """
-    framing = spec.get("framing", "").lower()
-    if "full body" not in framing:
-        return spec
-    pose_lower = spec.get("pose", "").lower()
-    if not any(kw in pose_lower for kw in _NON_UPRIGHT_POSE_KEYWORDS):
-        return spec
     out = dict(spec)
-    out["pose"] = "standing upright at full height, feet visible on the ground, full head-to-toe body in frame"
+    framing_l = out.get("framing", "").lower()
+    pose_l = out.get("pose", "").lower()
+    prop_val = out.get("prop")
+    prop_l = (prop_val or "").lower()
+
+    # RULE 1 — upright pose for full-body framings
+    if "full body" in framing_l and any(
+        kw in pose_l for kw in _NON_UPRIGHT_POSE_KEYWORDS
+    ):
+        out["pose"] = (
+            "standing upright at full height, feet visible on the ground, "
+            "full head-to-toe body in frame"
+        )
+        pose_l = out["pose"].lower()
+
+    # RULE 2 — close-ups drop handheld props (invisible anyway)
+    if prop_val and any(kw in framing_l for kw in _CLOSE_FRAMING_KEYWORDS):
+        if any(kw in prop_l for kw in _HANDHELD_PROP_KEYWORDS):
+            out["prop"] = None
+            prop_val = None
+            prop_l = ""
+
+    # RULE 3 — hands-occupied poses drop handheld props (physical conflict)
+    if prop_val and any(kw in pose_l for kw in _HANDS_OCCUPIED_BY_POSE_KEYWORDS):
+        if any(kw in prop_l for kw in _HANDHELD_PROP_KEYWORDS):
+            out["prop"] = None
+
     return out
+
+
+# Backwards-compat alias — old name used elsewhere
+_adapt_spec_for_framing = _adapt_spec_for_coherence
 
 
 def build_prompt_text(spec, trigger, outfit=None):
