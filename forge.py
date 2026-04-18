@@ -1382,26 +1382,34 @@ def run_batch_poll(output_dir: Path, api_key: str, model: str,
             if total:
                 stats_str = f" · completed {done}/{total} (failed {failed})"
 
-        # Staleness check — if state is RUNNING but server hasn't updated in a while,
-        # Google's pipeline may not be progress-reporting. Flag it.
+        # Always compute staleness — makes it visible at every poll instead
+        # of hiding it behind a 10-min threshold.
         stale_str = ""
+        stale_sec = 0.0
         up = getattr(job, "update_time", None)
-        if up is not None and state_name == "JOB_STATE_RUNNING":
+        if up is not None:
             import datetime as _dt
             now = _dt.datetime.now(_dt.timezone.utc)
             try:
                 stale_sec = (now - up).total_seconds()
-                if stale_sec > 600:
-                    stale_str = f" · server silent {stale_sec/60:.0f}min"
+                if stale_sec >= 30:
+                    stale_str = f" · server last updated {stale_sec/60:.1f}min ago"
             except Exception:
                 pass
 
         msgq.put(ProgressMsg(kind="batch_status",
-                             text=f"{state_name} · {elapsed/60:.1f}min{stats_str}"))
+                             text=f"{state_name} · {elapsed/60:.1f}min{stats_str}{stale_str}"))
 
         if state_name != last_state:
+            # On any state transition, dump the full Google-reported snapshot —
+            # same info as the debug script, so users don't need to drop to a
+            # Python shell to introspect a batch.
+            ct = getattr(job, "create_time", None)
+            st = getattr(job, "start_time", None)
             msgq.put(ProgressMsg(kind="log",
                 text=f"[batch] state={state_name} (poll #{poll_count}, {elapsed/60:.1f}min elapsed){stats_str}"))
+            msgq.put(ProgressMsg(kind="log",
+                text=f"[batch]   create_time={ct}  start_time={st}  update_time={up}"))
             last_state = state_name
         elif poll_count % 5 == 0:
             msgq.put(ProgressMsg(kind="log",
