@@ -23,6 +23,9 @@ IDENTITY LOCK (non-negotiable):
 VARIATION (what changes per image):
 - Pose, expression, framing, camera angle, lighting, environment, weather, props, and (when specified) outfit.
 
+COHERENCE RULE:
+- If the specified outfit and environment would be contextually incoherent (e.g. evening gown in a gym, winter coat on a beach), adapt the environment to suit the outfit rather than producing a nonsensical scene. Identity preservation takes precedence over strict environment fidelity.
+
 ANATOMY & QUALITY (non-negotiable):
 - Sharp focus on the face and eyes. Both eyes correctly rendered with accurate catchlights and pupils.
 - Anatomically correct hands: exactly five fingers per hand, no warping, no fused digits, no extra fingers, no missing fingers.
@@ -456,7 +459,12 @@ def build_prompt_text(spec, trigger, outfit=None):
 
 
 def build_caption(spec, trigger, outfit=None):
-    """Qwen-Image-style caption: single line, trigger first, natural language."""
+    """Qwen-Image-style caption: single line, trigger first, natural language.
+
+    Kohya/musubi/ai-toolkit convention: the trigger word appears ONCE, at the
+    start. Avoids re-binding the trigger to framing descriptors instead of the
+    character identity.
+    """
     outfit_phrase = f", wearing {outfit}" if outfit else ""
     prop_phrase = f", {spec['prop']}" if spec.get("prop") else ""
     weather_phrase = (
@@ -465,7 +473,7 @@ def build_caption(spec, trigger, outfit=None):
         f", {spec['weather']} visible through the window"
     )
     caption = (
-        f"{trigger}, {spec['framing']} of {trigger}{outfit_phrase}, "
+        f"{trigger}, {spec['framing']}{outfit_phrase}, "
         f"{spec['angle']}, {spec['expression']}, {spec['pose']}{prop_phrase}, "
         f"{spec['environment']}{weather_phrase}, {spec['lighting']}. "
         f"photorealistic portrait."
