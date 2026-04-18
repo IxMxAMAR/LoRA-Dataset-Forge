@@ -855,10 +855,6 @@ def clear_batch_state(output_dir: Path):
         pass
 
 
-def _b64(data: bytes) -> str:
-    return base64.b64encode(data).decode("ascii")
-
-
 def _cleanup_ref_files(engine: "GeminiEngine", names: list[str]) -> int:
     """Delete uploaded Files API entries. Safe to call with any mix of names.
     Returns count successfully deleted. Silent on individual failures (Google
