@@ -214,7 +214,19 @@ Nano Banana Pro is roughly 3× more per image — worth it for a final polish pa
 
 ## Sync vs batch — practical guidance
 
-**Use sync mode (default) for small runs up to ~100 images per character.** Wall clock is ~40 seconds per 30 images with 4 workers, and you get live feedback. The 50% batch discount on a $1.20 run saves $0.60 — not worth giving up instant feedback.
+**Use sync mode (default) for small runs up to ~100 images per character.** The 50% batch discount on small runs saves under a dollar — not worth giving up instant feedback.
+
+**Realistic sync-mode wall-clock times** depend heavily on model, resolution, and whether `verify captions` is on. Expect:
+
+| config (30 images, 4 workers) | per-image | total |
+|---|---|---|
+| Nano Banana 2 · 1K · no verify | ~4 s | ~30 s |
+| Nano Banana 2 · 2K · no verify | ~6-10 s | ~1 min |
+| Nano Banana 2 · 4K · no verify | ~20-30 s | ~2-3 min |
+| Nano Banana 2 · 4K · **verify on** | **~60-90 s** | **~5-8 min** |
+| Nano Banana Pro · 2K · no verify | ~15-25 s | ~2-3 min |
+
+`verify captions` ON roughly doubles per-image time because each image triggers a second API call (vision re-captioner). 4K output is 2-3× slower than 2K. Bumping workers from 4 to 8 roughly halves wall time up to Gemini's rate limit.
 
 **Batch mode is worth considering when:**
 - You're doing 300+ images per character in one shot (savings exceed $5+)

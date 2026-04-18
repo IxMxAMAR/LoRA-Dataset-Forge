@@ -55,16 +55,26 @@ FRAMINGS = [
 ]
 
 ANGLES = [
+    # Front + three-quarter angles dominate (5/10) — these are what binds
+    # facial identity in a LoRA. Both eyes visible, clear bone structure.
     "front-facing, eye level",
     "three-quarter left turn",
     "three-quarter right turn",
-    "straight profile, facing left",
-    "straight profile, facing right",
+    "slight three-quarter left, looking just past the camera",
+    "slight three-quarter right, looking just past the camera",
+    # Over-shoulder variants still show most of the face.
     "looking over the left shoulder toward the camera",
     "looking over the right shoulder toward the camera",
+    # Low / high angle keep both eyes in frame.
     "slight low angle, camera below eye level looking up",
     "slight high angle, camera above looking down",
+    # One back-with-turn — shows hair + partial face.
     "back view with the head turned toward the camera",
+    # NOTE: dead 90° side profiles deliberately removed. They were ~20% of
+    # the old pool and hurt LoRA identity training (one eye hidden, weak
+    # facial signature). If you specifically want profile shots, add them
+    # back here — but for a character LoRA, 0-10% profile coverage is the
+    # industry norm.
 ]
 
 EXPRESSIONS = [
@@ -535,45 +545,57 @@ def plan_jobs_distributed(distribution: dict, vary_outfit: bool, trigger: str,
                           exclude=None) -> list:
     """Return (flat, spec, outfit, category) for each slot matching the distribution.
 
-    Sampled in category order: close → mid → full → random. Deterministic per
-    (trigger, category) so regenerating rejected slots produces fresh picks that
-    remain consistent across runs.
+    Stratified by framing within each category — round-robins through the
+    category's framings so the user reliably gets coverage of every framing
+    kind they asked for, instead of RNG variance producing (e.g.) zero
+    "full body head to feet" shots in a 7-slot "full" category request.
+
+    Deterministic per (trigger, category) so regenerating rejected slots
+    produces fresh picks that remain consistent across runs.
     """
     exclude = set(exclude or [])
-    total_space = combinatorial_capacity(vary_outfit=vary_outfit)
     jobs: list = []
     used = set(exclude)
+
+    outfit_n = len(OUTFITS) if vary_outfit else 1
+    # Size of the sub-space below the framing axis. Any flat index with a
+    # given framing fi is of the form: fi * axes_below + inner, where
+    # inner is in [0, axes_below). This lets us directly construct flat
+    # indices for a specific target framing.
+    axes_below = (outfit_n * len(WEATHERS) * len(PROPS) * len(SCENES)
+                  * len(LIGHTINGS) * len(EXPRESSIONS) * len(ANGLES))
 
     for cat in CATEGORY_ORDER:
         needed = distribution.get(cat, 0)
         if needed <= 0:
             continue
+
+        framings_to_use = (FRAMING_CATEGORIES.get(cat) if cat != "random" else FRAMINGS)
+        if not framings_to_use:
+            continue
+
         rng = random.Random(_seed_for(f"{trigger}__{cat}"))
-        picked_here = 0
-        attempts_left = 4
-        batch_k = min(max(needed * 80 + 500, 2000), total_space)
-        # Top-up loop — if the initial oversample doesn't produce enough
-        # in-category non-excluded hits, grow and re-sample from advanced
-        # RNG state until we hit `needed` or exhaust attempts.
-        while picked_here < needed and attempts_left > 0:
-            k = min(batch_k, total_space)
-            try:
-                candidates = rng.sample(range(total_space), k=k)
-            except ValueError:
-                break
-            for flat in candidates:
+        # Deterministic framing order, different per trigger
+        shuffled = list(framings_to_use)
+        rng.shuffle(shuffled)
+
+        for slot_idx in range(needed):
+            target_framing = shuffled[slot_idx % len(shuffled)]
+            target_fi = FRAMINGS.index(target_framing)
+            base = target_fi * axes_below
+            # Find a non-excluded inner index. Collision rate is negligible
+            # (axes_below is millions, exclude is at most thousands).
+            attempts = 0
+            while attempts < 1000:
+                inner = rng.randrange(axes_below)
+                flat = base + inner
                 if flat in used:
+                    attempts += 1
                     continue
                 spec, outfit = decode_flat(flat, vary_outfit)
-                if cat != "random" and category_for(spec["framing"]) != cat:
-                    continue
                 jobs.append((flat, spec, outfit, cat))
                 used.add(flat)
-                picked_here += 1
-                if picked_here >= needed:
-                    break
-            attempts_left -= 1
-            batch_k = min(batch_k * 4, total_space)
+                break
 
     return jobs
 
@@ -581,19 +603,20 @@ def plan_jobs_distributed(distribution: dict, vary_outfit: bool, trigger: str,
 def smart_aspect(framing: str) -> str:
     """Pick a training-friendly aspect ratio per framing.
 
-    Tuned for tall character subjects: full-body maps to 9:16, mid-shots to
-    4:5 (instead of square which crops shoulders awkwardly), close-ups to 3:4
-    (keeps face pixel density high).
+    Tuned for tall character subjects:
+    - Close-ups → 3:4 (keeps face pixel density high)
+    - Mid-shots → 4:5 (slight portrait; square would crop shoulders)
+    - All full-body variants → 2:3 (classic portrait, shows height with
+      comfortable context on the sides)
+    9:16 was dropped after user testing — too narrow for most character
+    LoRA training use cases. If you want it back for specific framings,
+    edit this mapping.
     """
     f = framing.lower()
     if "extreme close" in f or "tight close" in f or "close-up" in f or "bust" in f:
         return "3:4"
     if "waist-up" in f or "half-body" in f or "medium shot" in f:
         return "4:5"
-    if "three-quarter body" in f:
+    if "three-quarter body" in f or "full body" in f:
         return "2:3"
-    if "full body wide" in f:
-        return "2:3"
-    if "full body" in f:
-        return "9:16"
     return "3:4"
