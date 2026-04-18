@@ -2,6 +2,9 @@
 _settings.json
 _settings.json.tmp
 
+# Internal audit/planning docs — not for public repo
+docs/
+
 # Python
 __pycache__/
 *.pyc

@@ -257,7 +257,7 @@ LIGHTINGS = [...]      # 18 entries → add a neon sign or a fireplace glow
 
 Each new entry multiplies variety for every character. Pull requests welcome.
 
-If you want to go deeper, the [docs/audit.md](docs/audit.md) and [docs/fix-plan.md](docs/fix-plan.md) files document the architecture review from the last release pass — a good map of the codebase.
+The codebase is small enough to skim. Start at `ForgeApp.__init__` in `forge.py` and follow the UI-build and message-handler trail.
 
 ---
 
