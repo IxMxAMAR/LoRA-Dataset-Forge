@@ -855,6 +855,38 @@ def clear_batch_state(output_dir: Path):
         pass
 
 
+def _download_batch_result(engine: "GeminiEngine", result_file: str,
+                           api_key: str, msgq) -> bytes:
+    """Download a batch result file. Tries the SDK first; falls back to a
+    direct HTTP GET on the download URI if the SDK download raises (known
+    python-genai issue #1759 where batch result file names can exceed the
+    Files API 40-char limit and the SDK rejects them).
+    """
+    try:
+        return engine.client.files.download(file=result_file)
+    except Exception as e:
+        msg = str(e)
+        msgq.put(ProgressMsg(kind="log",
+            text=f"[batch] SDK download failed ({type(e).__name__}: {msg[:120]}), trying HTTP fallback..."))
+    # Fallback: look up the file metadata (which still works for .get even if
+    # .download doesn't), extract the download URI, fetch it with urllib.
+    try:
+        f = engine.client.files.get(name=result_file)
+    except Exception as e:
+        raise RuntimeError(
+            f"both SDK download and metadata lookup failed for {result_file}: {e}"
+        )
+    uri = getattr(f, "download_uri", None) or getattr(f, "uri", None)
+    if not uri:
+        raise RuntimeError(f"no download URI on batch result {result_file}")
+    # urllib is stdlib — no new deps. Gemini Files endpoints require the
+    # x-goog-api-key header (or ?key= query) for auth.
+    import urllib.request
+    req = urllib.request.Request(uri, headers={"x-goog-api-key": api_key})
+    with urllib.request.urlopen(req, timeout=300) as resp:
+        return resp.read()
+
+
 def _cleanup_ref_files(engine: "GeminiEngine", names: list[str]) -> int:
     """Delete uploaded Files API entries. Safe to call with any mix of names.
     Returns count successfully deleted. Silent on individual failures (Google
@@ -1216,12 +1248,17 @@ def run_batch_submit(chars: list, output_dir: Path, api_key: str, model: str,
         except Exception:
             pass
 
-    # Submit batch
+    # Submit batch. Use the typed config class (not a bare dict) — the dict
+    # form is coerced by the SDK but known to silently drop unknown fields
+    # (python-genai issue #1389).
     try:
+        types = engine._types
         batch_job = engine.client.batches.create(
             model=model,
             src=uploaded.name,
-            config={"display_name": f"lora-forge-{int(time.time())}"},
+            config=types.CreateBatchJobConfig(
+                display_name=f"lora-forge-{int(time.time())}",
+            ),
         )
     except Exception as e:
         msgq.put(ProgressMsg(kind="error", text=f"Batch submit failed: {e}"))
@@ -1382,13 +1419,16 @@ def run_batch_poll(output_dir: Path, api_key: str, model: str,
 
     # Download results to a temp file, then stream-read line by line.
     # Avoids holding the full decoded result (500MB+ for a large batch) in memory alongside bytes.
+    # Some batch result file names exceed the Files API 40-char limit
+    # (python-genai issue #1759) — if the SDK's `files.download` fails with
+    # that class of error, fall back to a direct HTTP GET using the URI.
     result_temp: Optional[Path] = None
     try:
         result_file = job.dest.file_name if job.dest else None
         if not result_file:
             raise RuntimeError("no dest file on completed batch")
         msgq.put(ProgressMsg(kind="log", text=f"Downloading results from {result_file}..."))
-        result_bytes = engine.client.files.download(file=result_file)
+        result_bytes = _download_batch_result(engine, result_file, api_key, msgq)
         with tempfile.NamedTemporaryFile(
             prefix="forge_result_", suffix=".jsonl", delete=False, mode="wb",
         ) as tmpf:
@@ -1461,6 +1501,21 @@ def run_batch_poll(output_dir: Path, api_key: str, model: str,
             fr = cand.get("finishReason") or cand.get("finish_reason")
             if fr:
                 refusal_text = (refusal_text + f" finish={fr}").strip()
+            # Surface which specific safety categories blocked the request —
+            # 'finish=SAFETY' alone tells the user nothing actionable. The
+            # category name (e.g. HARM_CATEGORY_SEXUALLY_EXPLICIT) at least
+            # tells them which prompt direction to avoid.
+            for rating in (cand.get("safetyRatings") or []):
+                cat = rating.get("category") or ""
+                prob = rating.get("probability") or ""
+                blocked = rating.get("blocked", False)
+                if blocked or prob in ("HIGH", "MEDIUM"):
+                    refusal_text = (refusal_text + f" {cat}={prob}").strip()
+        # Also check top-level promptFeedback for block reasons
+        pf = resp.get("promptFeedback") or {}
+        pf_block = pf.get("blockReason") or pf.get("block_reason")
+        if pf_block and not image_data:
+            refusal_text = (refusal_text + f" promptBlock={pf_block}").strip()
 
         if image_data:
             try:
@@ -2417,6 +2472,10 @@ class ReviewWindow:
                 "reason": info.get("validate_reason"),
                 "flat": info.get("flat"),
             })
+        # O(1) index by slot — used by click/poll hot paths that would
+        # otherwise scan the full list per event (500 × 500 = 250k cmps
+        # on a large validation run).
+        self._slot_by_id = {s["slot"]: s for s in out}
         return out
 
     # -------- UI --------
@@ -2568,7 +2627,9 @@ class ReviewWindow:
         w["frame"].configure(highlightbackground=color, highlightcolor=color)
 
     def _toggle_rejection(self, slot):
-        info = next(s for s in self.slots if s["slot"] == slot)
+        info = self._slot_by_id.get(slot)
+        if info is None:
+            return
         info["rejected"] = not info["rejected"]
         self._apply_border(info)
         self._update_summary()
@@ -2657,7 +2718,9 @@ class ReviewWindow:
                         continue
                     if slot == "ERR":
                         continue
-                    info = next(s for s in self.slots if s["slot"] == slot)
+                    info = self._slot_by_id.get(slot)
+                    if info is None:
+                        continue
                     info["score"] = score
                     info["reason"] = reason
                     w = self._thumb_widgets.get(slot)
@@ -3355,6 +3418,16 @@ class ForgeApp:
                 char.count = sum(clean.values())
 
     def _on_close(self):
+        # Signal any running worker thread to halt — a sync job's
+        # ThreadPoolExecutor contains non-daemon threads, and without this
+        # signal they'll hold the interpreter open until their 300s Gemini
+        # timeout drains. Batch poll threads are daemons so they exit with
+        # the process; setting the event just short-circuits any in-flight
+        # polling loop immediately.
+        try:
+            self.stop_event.set()
+        except Exception:
+            pass
         # Flush pending save synchronously
         if self._save_after_id:
             try:
