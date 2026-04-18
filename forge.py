@@ -874,6 +874,10 @@ def _download_batch_result(engine: "GeminiEngine", result_file: str,
     direct HTTP GET on the download URI if the SDK download raises (known
     python-genai issue #1759 where batch result file names can exceed the
     Files API 40-char limit and the SDK rejects them).
+
+    Returns the full file contents as bytes. The caller streams them out
+    to a temp file immediately and frees the buffer, so peak RAM is the
+    size of the result JSONL once.
     """
     try:
         return engine.client.files.download(file=result_file)
@@ -882,7 +886,9 @@ def _download_batch_result(engine: "GeminiEngine", result_file: str,
         msgq.put(ProgressMsg(kind="log",
             text=f"[batch] SDK download failed ({type(e).__name__}: {msg[:120]}), trying HTTP fallback..."))
     # Fallback: look up the file metadata (which still works for .get even if
-    # .download doesn't), extract the download URI, fetch it with urllib.
+    # .download doesn't), extract the download URI, fetch it via urllib
+    # streaming in 1MB chunks so the HTTP response body doesn't also sit in
+    # RAM alongside the eventual bytes object we return.
     try:
         f = engine.client.files.get(name=result_file)
     except Exception as e:
@@ -892,12 +898,17 @@ def _download_batch_result(engine: "GeminiEngine", result_file: str,
     uri = getattr(f, "download_uri", None) or getattr(f, "uri", None)
     if not uri:
         raise RuntimeError(f"no download URI on batch result {result_file}")
-    # urllib is stdlib — no new deps. Gemini Files endpoints require the
-    # x-goog-api-key header (or ?key= query) for auth.
     import urllib.request
+    from io import BytesIO
     req = urllib.request.Request(uri, headers={"x-goog-api-key": api_key})
+    buf = BytesIO()
     with urllib.request.urlopen(req, timeout=300) as resp:
-        return resp.read()
+        while True:
+            chunk = resp.read(1 << 20)  # 1 MB at a time
+            if not chunk:
+                break
+            buf.write(chunk)
+    return buf.getvalue()
 
 
 def _cleanup_ref_files(engine: "GeminiEngine", names: list[str]) -> int:
@@ -970,13 +981,18 @@ def _upload_ref_via_files_api(engine: "GeminiEngine", jpeg_bytes: bytes,
     reference a PROCESSING file and waste request budget on resolution errors.
     """
     types = engine._types
-    # Files API requires a file path, not bytes — write to temp
+    # Files API requires a file path, not bytes — write to temp.
+    # Nested try/finally guarantees the file handle is closed BEFORE we try
+    # to unlink it: Windows refuses to unlink an open file and would silently
+    # leak the temp file + handle until process exit if write() ever raised.
     tmp = tempfile.NamedTemporaryFile(
         prefix="ref_", suffix=".jpg", delete=False,
     )
     try:
-        tmp.write(jpeg_bytes)
-        tmp.close()
+        try:
+            tmp.write(jpeg_bytes)
+        finally:
+            tmp.close()
         uploaded = engine.client.files.upload(
             file=tmp.name,
             config=types.UploadFileConfig(
