@@ -492,12 +492,24 @@ class ProgressMsg:
     total: int = 0
 
 
-def _load_jpeg_bytes(path: Path) -> bytes:
+# Reference images are downscaled before upload — identity conditioning does not
+# benefit from >1280px refs, and full-res embedded references bloat JSONL uploads
+# by an order of magnitude (240 imgs × 2 refs × 3MB → 200MB+ payloads).
+REF_MAX_DIM = 1280
+REF_JPEG_QUALITY = 88
+
+
+def _load_jpeg_bytes(path: Path, max_dim: int = REF_MAX_DIM,
+                     quality: int = REF_JPEG_QUALITY) -> bytes:
+    """Load an image, downscale to `max_dim` on the longest side, re-encode JPEG.
+    Never upscales — tiny refs stay tiny. ~200-400 KB per ref after compression.
+    """
     with Image.open(path) as im:
         im = im.convert("RGB")
+        im.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
         from io import BytesIO
         buf = BytesIO()
-        im.save(buf, format="JPEG", quality=95)
+        im.save(buf, format="JPEG", quality=quality, optimize=True)
         return buf.getvalue()
 
 
@@ -994,9 +1006,11 @@ def run_batch_submit(chars: list, output_dir: Path, api_key: str, model: str,
     msgq.put(ProgressMsg(kind="log",
         text=f"Batch submitted: {batch_job.name} · {len(key_map)} request(s) · "
              f"initial state={batch_job.state.name}"))
+    # Deliberately NOT emitting 'done' here — the poller will emit it on
+    # actual completion. Emitting 'done' now would show a misleading
+    # "batch finished" log line while the batch is still processing.
     msgq.put(ProgressMsg(kind="batch_submitted",
                          text=batch_job.name, current=len(key_map)))
-    msgq.put(ProgressMsg(kind="done"))
 
 
 def run_batch_poll(output_dir: Path, api_key: str, model: str,
@@ -1021,6 +1035,11 @@ def run_batch_poll(output_dir: Path, api_key: str, model: str,
     msgq.put(ProgressMsg(kind="log", text=f"Polling batch {batch_name} every {BATCH_POLL_SECONDS}s..."))
 
     job = None
+    start_time = time.time()
+    poll_count = 0
+    last_state: Optional[str] = None
+    pending_note_shown = False
+
     while not stop_event.is_set():
         try:
             job = engine.client.batches.get(name=batch_name)
@@ -1032,8 +1051,28 @@ def run_batch_poll(output_dir: Path, api_key: str, model: str,
                 time.sleep(1)
             continue
 
+        poll_count += 1
         state_name = getattr(job.state, "name", str(job.state))
-        msgq.put(ProgressMsg(kind="batch_status", text=state_name))
+        elapsed = time.time() - start_time
+
+        msgq.put(ProgressMsg(kind="batch_status", text=f"{state_name} · {elapsed/60:.1f}min"))
+
+        # Log every state transition, plus a periodic "still waiting" every 5 polls (~2.5min)
+        if state_name != last_state:
+            msgq.put(ProgressMsg(kind="log",
+                text=f"[batch] state={state_name} (poll #{poll_count}, {elapsed/60:.1f}min elapsed)"))
+            last_state = state_name
+        elif poll_count % 5 == 0:
+            msgq.put(ProgressMsg(kind="log",
+                text=f"[batch] still {state_name} (poll #{poll_count}, {elapsed/60:.1f}min elapsed)"))
+
+        # Nudge if PENDING for a long time — not a bug, just a slow queue
+        if (state_name == "JOB_STATE_PENDING" and elapsed > 600 and not pending_note_shown):
+            msgq.put(ProgressMsg(kind="log",
+                text=("[batch] PENDING for 10+ minutes — this is Google's server-side queue, not a client bug. "
+                      "New accounts, free tier, or peak-hour submissions can wait 10-60+ minutes before "
+                      "flipping to RUNNING. The app can be closed and reopened; polling resumes.")))
+            pending_note_shown = True
 
         if state_name in BATCH_COMPLETED_STATES:
             break
@@ -3037,6 +3076,10 @@ class ForgeApp:
             r.count_var.set(n)
 
     def _start_job(self):
+        if self._job_running:
+            messagebox.showinfo("busy",
+                "a job is already running — stop it first, or wait for the current batch to finish.")
+            return
         api_key = self.api_var.get().strip()
         if not api_key:
             messagebox.showerror("no api key", "enter your GEMINI_API_KEY")
