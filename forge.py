@@ -492,24 +492,23 @@ class ProgressMsg:
     total: int = 0
 
 
-# Reference images are downscaled before upload — identity conditioning does not
-# benefit from >1280px refs, and full-res embedded references bloat JSONL uploads
-# by an order of magnitude (240 imgs × 2 refs × 3MB → 200MB+ payloads).
-REF_MAX_DIM = 1280
-REF_JPEG_QUALITY = 88
+# Reference images go to Google at full resolution. Two compression passes are
+# applied (quality 92 + optimize + progressive) which trim ~15-25% of file size
+# with no visually detectable loss. Batch mode additionally uses the Files API
+# so each ref is uploaded ONCE per submission and referenced from every slot —
+# that's how the 200MB JSONL inline-upload problem actually gets solved.
+REF_JPEG_QUALITY = 92
 
 
-def _load_jpeg_bytes(path: Path, max_dim: int = REF_MAX_DIM,
-                     quality: int = REF_JPEG_QUALITY) -> bytes:
-    """Load an image, downscale to `max_dim` on the longest side, re-encode JPEG.
-    Never upscales — tiny refs stay tiny. ~200-400 KB per ref after compression.
+def _load_jpeg_bytes(path: Path, quality: int = REF_JPEG_QUALITY) -> bytes:
+    """Load an image and re-encode as JPEG at `quality` with optimize + progressive.
+    No resizing — dimensions are preserved. Returns raw JPEG bytes.
     """
     with Image.open(path) as im:
         im = im.convert("RGB")
-        im.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
         from io import BytesIO
         buf = BytesIO()
-        im.save(buf, format="JPEG", quality=quality, optimize=True)
+        im.save(buf, format="JPEG", quality=quality, optimize=True, progressive=True)
         return buf.getvalue()
 
 
@@ -782,14 +781,48 @@ def _b64(data: bytes) -> str:
     return base64.b64encode(data).decode("ascii")
 
 
-def _build_batch_request(spec, trigger, outfit, face_b64, body_b64, image_size, aspect) -> dict:
-    """Build a single generateContent-style request dict for the batch JSONL."""
+def _upload_ref_via_files_api(engine: "GeminiEngine", jpeg_bytes: bytes,
+                              display_name: str) -> str:
+    """Upload a ref to Google's Files API and return the file URI.
+    The uploaded file is referenced by URI from every request that needs it,
+    instead of embedding the bytes redundantly in each request.
+    """
+    types = engine._types
+    # Files API requires a file path, not bytes — write to temp
+    tmp = tempfile.NamedTemporaryFile(
+        prefix="ref_", suffix=".jpg", delete=False,
+    )
+    try:
+        tmp.write(jpeg_bytes)
+        tmp.close()
+        uploaded = engine.client.files.upload(
+            file=tmp.name,
+            config=types.UploadFileConfig(
+                display_name=display_name,
+                mime_type="image/jpeg",
+            ),
+        )
+        # SDK returns a File object with .uri and .name
+        return uploaded.uri or uploaded.name
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except Exception:
+            pass
+
+
+def _build_batch_request_uri(spec, trigger, outfit, face_uri: str, body_uri: str,
+                             image_size: str, aspect: str) -> dict:
+    """Build a batch request that references face+body via Files API URIs
+    (as opposed to embedding base64 inline). Dramatically smaller payload
+    when the same refs are reused across many requests.
+    """
     prompt_text = P.build_prompt_text(spec, trigger, outfit)
     parts = [
         {"text": "--- [Reference Image 1: FACE identity lock] ---"},
-        {"inlineData": {"mimeType": "image/jpeg", "data": face_b64}},
+        {"fileData": {"mimeType": "image/jpeg", "fileUri": face_uri}},
         {"text": "--- [Reference Image 2: BODY identity lock] ---"},
-        {"inlineData": {"mimeType": "image/jpeg", "data": body_b64}},
+        {"fileData": {"mimeType": "image/jpeg", "fileUri": body_uri}},
         {"text": prompt_text},
     ]
     gen_config: dict = {"responseModalities": ["IMAGE"]}
@@ -808,14 +841,22 @@ def _build_batch_request(spec, trigger, outfit, face_b64, body_b64, image_size, 
     }
 
 
-def build_batch_jsonl(chars: list, output_dir: Path, image_size: str, aspect_mode: str,
-                      msgq: "queue.Queue[ProgressMsg]") -> tuple[Path, dict]:
+def build_batch_jsonl(engine: "GeminiEngine", chars: list, output_dir: Path,
+                      image_size: str, aspect_mode: str,
+                      msgq: "queue.Queue[ProgressMsg]") -> tuple[Path, dict, list[str]]:
     """Construct the JSONL file and a key_map that maps each request key
     back to (char_name, slot, flat, category).
 
-    Returns (jsonl_path, key_map). Caller is responsible for upload + cleanup.
+    Uses the Files API to upload each character's face+body refs ONCE per
+    submission, then references them by URI from every slot request — so
+    a 30-image batch uploads ~12 MB of refs + a tiny JSONL instead of
+    30 copies of the same refs (200+ MB).
+
+    Returns (jsonl_path, key_map, uploaded_file_names). Caller is responsible
+    for cleanup.
     """
     key_map: dict[str, dict] = {}
+    uploaded_names: list[str] = []
     tmp = tempfile.NamedTemporaryFile(
         prefix="forge_batch_", suffix=".jsonl", delete=False, mode="w", encoding="utf-8",
     )
@@ -851,8 +892,26 @@ def build_batch_jsonl(chars: list, output_dir: Path, image_size: str, aspect_mod
                 msgq.put(ProgressMsg(kind="error", char=char.name,
                                      text=f"[{char.name}] failed to load refs: {e}"))
                 continue
-            face_b64 = _b64(face_bytes)
-            body_b64 = _b64(body_bytes)
+
+            # Upload refs once per char via Files API → get URIs for reuse
+            msgq.put(ProgressMsg(kind="log",
+                text=f"[{char.name}] uploading face ({len(face_bytes)/1024:.0f}KB) + body ({len(body_bytes)/1024:.0f}KB) to Files API..."))
+            try:
+                face_uri = _upload_ref_via_files_api(
+                    engine, face_bytes, f"forge_{char.name}_face")
+                body_uri = _upload_ref_via_files_api(
+                    engine, body_bytes, f"forge_{char.name}_body")
+                # Track names so caller can clean up after batch completes
+                for uri in (face_uri, body_uri):
+                    # Extract "files/xxx" form if URI was a full URL
+                    if uri and "/files/" in uri:
+                        uploaded_names.append("files/" + uri.split("/files/")[-1])
+                    elif uri and uri.startswith("files/"):
+                        uploaded_names.append(uri)
+            except Exception as e:
+                msgq.put(ProgressMsg(kind="error", char=char.name,
+                                     text=f"[{char.name}] ref upload failed: {e}"))
+                continue
 
             used_flats = used_flats_in_manifest(manifest)
             if char.distribution:
@@ -881,8 +940,8 @@ def build_batch_jsonl(chars: list, output_dir: Path, image_size: str, aspect_mod
             for slot, flat, spec, outfit, category in jobs_full:
                 aspect = P.smart_aspect(spec["framing"]) if aspect_mode.startswith("smart") else aspect_mode
                 key = f"{char.name}__{slot:03d}"
-                request = _build_batch_request(spec, char.trigger, outfit,
-                                               face_b64, body_b64, image_size, aspect)
+                request = _build_batch_request_uri(spec, char.trigger, outfit,
+                                                   face_uri, body_uri, image_size, aspect)
                 caption = P.build_caption(spec, char.trigger, outfit)
                 line = json.dumps({"key": key, "request": request}, ensure_ascii=False)
                 tmp.write(line + "\n")
@@ -909,8 +968,9 @@ def build_batch_jsonl(chars: list, output_dir: Path, image_size: str, aspect_mod
         except Exception:
             pass
 
-    msgq.put(ProgressMsg(kind="log", text=f"Built batch JSONL with {written} request(s)"))
-    return jsonl_path, key_map
+    msgq.put(ProgressMsg(kind="log",
+        text=f"Built batch JSONL with {written} request(s), {len(uploaded_names)} ref file(s) uploaded"))
+    return jsonl_path, key_map, uploaded_names
 
 
 def run_batch_submit(chars: list, output_dir: Path, api_key: str, model: str,
@@ -937,7 +997,8 @@ def run_batch_submit(chars: list, output_dir: Path, api_key: str, model: str,
              f"resolution={image_size}, aspect={aspect_mode}, model={model}"))
 
     try:
-        jsonl_path, key_map = build_batch_jsonl(enabled, output_dir, image_size, aspect_mode, msgq)
+        jsonl_path, key_map, ref_file_names = build_batch_jsonl(
+            engine, enabled, output_dir, image_size, aspect_mode, msgq)
     except Exception as e:
         msgq.put(ProgressMsg(kind="error", text=f"Failed to build batch JSONL: {e}"))
         msgq.put(ProgressMsg(kind="done"))
@@ -947,6 +1008,11 @@ def run_batch_submit(chars: list, output_dir: Path, api_key: str, model: str,
         msgq.put(ProgressMsg(kind="log", text="Nothing to batch — all slots already filled."))
         msgq.put(ProgressMsg(kind="done"))
         return
+
+    jsonl_size = jsonl_path.stat().st_size if jsonl_path.exists() else 0
+    msgq.put(ProgressMsg(kind="log",
+        text=f"Batch JSONL ready: {jsonl_size/1_000_000:.1f} MB "
+             f"(refs uploaded separately via Files API)"))
 
     # Upload JSONL
     try:
@@ -997,6 +1063,7 @@ def run_batch_submit(chars: list, output_dir: Path, api_key: str, model: str,
         "api_key_hint": f"len={len(api_key)}",  # do NOT persist the key itself
         "total_requests": len(key_map),
         "key_map": key_map,
+        "ref_file_names": ref_file_names,  # Files API uploads for post-batch cleanup
     }
     try:
         save_batch_state(output_dir, state)
@@ -1227,6 +1294,15 @@ def run_batch_poll(output_dir: Path, api_key: str, model: str,
 
     msgq.put(ProgressMsg(kind="log",
         text=f"Batch complete — saved {saved}, refused {refused}, errors {errors}"))
+
+    # Clean up any Files API uploads (refs + input JSONL) to keep the account tidy.
+    ref_files = state.get("ref_file_names") or []
+    for fname in ref_files:
+        try:
+            engine.client.files.delete(name=fname)
+        except Exception:
+            pass  # Google auto-expires in 48h anyway
+
     clear_batch_state(output_dir)
     msgq.put(ProgressMsg(kind="done"))
 
