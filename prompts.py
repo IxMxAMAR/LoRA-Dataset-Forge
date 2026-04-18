@@ -434,7 +434,38 @@ def plan_jobs(count, vary_outfit=False, trigger="default", exclude=None):
 # Prompt + caption rendering
 # ---------------------------------------------------------------------------
 
+# Poses where the character is NOT standing at full height. When a full-body
+# framing gets paired with one of these, the resulting image shows her seated
+# or kneeling — defeats the training signal for the character's actual height.
+_NON_UPRIGHT_POSE_KEYWORDS = (
+    "seated", "sitting", "kneeling", "curled", "lying", "reclining",
+    "crouch", "crouched", "folded to one side",
+)
+
+
+def _adapt_spec_for_framing(spec: dict) -> dict:
+    """Return a spec (copy) with pose adapted if it'd contradict the framing.
+
+    Full-body framings require an upright pose to show the character's actual
+    height. If the scene's natural pose is seated/kneeling/etc., rewrite to
+    "standing upright" — environment is preserved so we still get scene
+    variety (standing in a café, standing in a library, etc.).
+
+    Returns the original spec untouched if no adaptation is needed.
+    """
+    framing = spec.get("framing", "").lower()
+    if "full body" not in framing:
+        return spec
+    pose_lower = spec.get("pose", "").lower()
+    if not any(kw in pose_lower for kw in _NON_UPRIGHT_POSE_KEYWORDS):
+        return spec
+    out = dict(spec)
+    out["pose"] = "standing upright at full height, feet visible on the ground, full head-to-toe body in frame"
+    return out
+
+
 def build_prompt_text(spec, trigger, outfit=None):
+    spec = _adapt_spec_for_framing(spec)
     outfit_line = (
         f"Outfit: {outfit}."
         if outfit else
@@ -475,6 +506,7 @@ def build_caption(spec, trigger, outfit=None):
     start. Avoids re-binding the trigger to framing descriptors instead of the
     character identity.
     """
+    spec = _adapt_spec_for_framing(spec)
     outfit_phrase = f", wearing {outfit}" if outfit else ""
     prop_phrase = f", {spec['prop']}" if spec.get("prop") else ""
     weather_phrase = (
