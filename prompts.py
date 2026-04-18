@@ -515,7 +515,13 @@ def category_for(framing: str) -> str:
 
 
 def slot_to_category(slot: int, distribution: dict) -> str:
-    """Given a 1-indexed slot number, return which category it belongs to per distribution."""
+    """Given a 1-indexed slot number, return which category it belongs to per distribution.
+
+    Returns "random" for any slot outside [1, sum(distribution.values())] — this
+    function is best-effort; callers should ensure slot ranges are in-bounds.
+    """
+    if slot < 1:
+        return "random"
     cum = 0
     for cat in CATEGORY_ORDER:
         n = distribution.get(cat, 0)
@@ -543,22 +549,31 @@ def plan_jobs_distributed(distribution: dict, vary_outfit: bool, trigger: str,
         if needed <= 0:
             continue
         rng = random.Random(_seed_for(f"{trigger}__{cat}"))
-        # Oversample aggressively — category hit rate varies from 30% (mid/full)
-        # to 100% (random). Overshooting is cheap; under-sampling fails silently.
-        batch_k = min(max(needed * 80 + 500, 2000), total_space)
-        candidates = rng.sample(range(total_space), k=batch_k)
         picked_here = 0
-        for flat in candidates:
-            if flat in used:
-                continue
-            spec, outfit = decode_flat(flat, vary_outfit)
-            if cat != "random" and category_for(spec["framing"]) != cat:
-                continue
-            jobs.append((flat, spec, outfit, cat))
-            used.add(flat)
-            picked_here += 1
-            if picked_here >= needed:
+        attempts_left = 4
+        batch_k = min(max(needed * 80 + 500, 2000), total_space)
+        # Top-up loop — if the initial oversample doesn't produce enough
+        # in-category non-excluded hits, grow and re-sample from advanced
+        # RNG state until we hit `needed` or exhaust attempts.
+        while picked_here < needed and attempts_left > 0:
+            k = min(batch_k, total_space)
+            try:
+                candidates = rng.sample(range(total_space), k=k)
+            except ValueError:
                 break
+            for flat in candidates:
+                if flat in used:
+                    continue
+                spec, outfit = decode_flat(flat, vary_outfit)
+                if cat != "random" and category_for(spec["framing"]) != cat:
+                    continue
+                jobs.append((flat, spec, outfit, cat))
+                used.add(flat)
+                picked_here += 1
+                if picked_here >= needed:
+                    break
+            attempts_left -= 1
+            batch_k = min(batch_k * 4, total_space)
 
     return jobs
 

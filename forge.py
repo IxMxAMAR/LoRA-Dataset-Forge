@@ -437,16 +437,35 @@ def _pick(images: list[Path], keywords: tuple[str, ...]) -> Optional[Path]:
 
 
 _UNSAFE_NAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+# Unicode bidi / invisible format chars — removed to prevent visual spoofing
+_INVISIBLE_CHARS = re.compile(r'[\u202a-\u202e\u2066-\u2069\u200b-\u200f\ufeff]')
+# Windows reserved device names (case-insensitive). Creating paths with these
+# names can redirect writes to the device or cause cryptic errors.
+_WIN_RESERVED = {
+    "CON", "PRN", "AUX", "NUL",
+    *{f"COM{i}" for i in range(1, 10)},
+    *{f"LPT{i}" for i in range(1, 10)},
+}
 
 
 def _sanitize_char_name(raw: str) -> str:
     """Return a character name safe to use as a filesystem path component.
-    Strips path separators, leading dots, illegal Windows chars, and the
-    legacy ' retouch' suffix. Returns empty string if nothing usable remains.
+
+    Strips path separators, leading dots, illegal Windows chars, invisible
+    Unicode controls (bidi/zero-width), the legacy ' retouch' suffix, and
+    rejects Windows reserved device names. Returns empty string if nothing
+    usable remains.
     """
     clean = raw.replace(" retouch", "").strip()
-    clean = clean.strip(". ")  # no leading dots/spaces → no ".." or hidden files
+    clean = clean.strip(". ")                 # no leading/trailing dots → no ".."
     clean = _UNSAFE_NAME_CHARS.sub("", clean)
+    clean = _INVISIBLE_CHARS.sub("", clean)
+    # Reject Windows reserved names (case-insensitive match on the stem)
+    if clean.upper().split(".")[0] in _WIN_RESERVED:
+        return ""
+    # Truncate to a reasonable filesystem-path-component limit
+    if len(clean) > 120:
+        clean = clean[:120].rstrip(". ")
     return clean
 
 
@@ -509,6 +528,11 @@ def scan_characters(root: Path) -> tuple[list[Character], list[str]]:
 
         face = _pick(imgs, FACE_KEYWORDS) or imgs[0]
         body = _pick(imgs, BODY_KEYWORDS) or (imgs[1] if len(imgs) > 1 else imgs[0])
+        if face == body:
+            warnings.append(
+                f"{clean}: face and body references are the same file "
+                f"({face.name}) — add a distinct full-body shot for better results"
+            )
         chars.append(Character(
             name=clean,
             folder=sub,
@@ -659,7 +683,10 @@ def run_job(chars, root, output_dir, api_key, model, image_size, aspect_mode,
         for slot in range(1, total_count + 1):
             img_path = out_char / f"{slot:03d}.png"
             txt_path = out_char / f"{slot:03d}.txt"
-            if img_path.exists() and txt_path.exists():
+            # Treat 0-byte or tiny PNGs as incomplete (crash mid-write survives
+            # a naive existence check but the file is unusable).
+            if (img_path.exists() and txt_path.exists()
+                    and img_path.stat().st_size > 1024):
                 continue
             slots_to_fill.append(slot)
 
@@ -842,13 +869,18 @@ def _cleanup_ref_files(engine: "GeminiEngine", names: list[str]) -> int:
 
 
 def _wait_for_file_active(engine: "GeminiEngine", file_name: str,
-                          timeout_s: int = 90) -> None:
+                          timeout_s: int = 90, msgq=None) -> None:
     """Poll the Files API until a just-uploaded file is ACTIVE (ready for use).
     Referencing a PROCESSING file in a batch request can cause per-request
     errors that still bill at batch rate — so we MUST wait before submitting.
     Raises RuntimeError on FAILED, TimeoutError past timeout_s.
+
+    Surfaces unknown/unspecified states every ~10s so the user sees progress
+    instead of a silent 90s stall.
     """
     start = time.time()
+    last_notified_state: Optional[str] = None
+    last_notify_time = start
     while time.time() - start < timeout_s:
         try:
             f = engine.client.files.get(name=file_name)
@@ -862,12 +894,23 @@ def _wait_for_file_active(engine: "GeminiEngine", file_name: str,
         if state_name == "FAILED":
             err = getattr(f, "error", None)
             raise RuntimeError(f"Files API reported FAILED for {file_name}: {err}")
+        # Surface unknown / long-waiting states to the user
+        now = time.time()
+        if msgq is not None and (state_name != last_notified_state or now - last_notify_time >= 10):
+            try:
+                msgq.put(ProgressMsg(kind="log",
+                    text=f"[files] {file_name} state={state_name or 'UNSPECIFIED'} "
+                         f"({now-start:.0f}s waited)"))
+            except Exception:
+                pass
+            last_notified_state = state_name
+            last_notify_time = now
         time.sleep(1.5)
     raise TimeoutError(f"file {file_name} never reached ACTIVE within {timeout_s}s")
 
 
 def _upload_ref_via_files_api(engine: "GeminiEngine", jpeg_bytes: bytes,
-                              display_name: str) -> tuple[str, str]:
+                              display_name: str, msgq=None) -> tuple[str, str]:
     """Upload a ref to Google's Files API and return (uri, short_name).
 
     `uri` is the full URL used in fileData.fileUri for model requests.
@@ -903,7 +946,7 @@ def _upload_ref_via_files_api(engine: "GeminiEngine", jpeg_bytes: bytes,
         raise RuntimeError(f"Files API upload returned empty identifier for {display_name}")
 
     # BLOCK until ACTIVE — referencing a PROCESSING file would bill for errors.
-    _wait_for_file_active(engine, short_name)
+    _wait_for_file_active(engine, short_name, msgq=msgq)
     return uri, short_name
 
 
@@ -1002,9 +1045,9 @@ def build_batch_jsonl(engine: "GeminiEngine", chars: list, output_dir: Path,
                      f"body ({len(body_bytes)/1024:.0f}KB) to Files API..."))
             try:
                 face_uri, face_name = _upload_ref_via_files_api(
-                    engine, face_bytes, f"forge_{char.name}_face")
+                    engine, face_bytes, f"forge_{char.name}_face", msgq=msgq)
                 body_uri, body_name = _upload_ref_via_files_api(
-                    engine, body_bytes, f"forge_{char.name}_body")
+                    engine, body_bytes, f"forge_{char.name}_body", msgq=msgq)
                 uploaded_names.extend([face_name, body_name])
                 msgq.put(ProgressMsg(kind="log",
                     text=f"[{char.name}] refs ACTIVE on Google — proceeding"))
@@ -1074,7 +1117,7 @@ def build_batch_jsonl(engine: "GeminiEngine", chars: list, output_dir: Path,
 
 
 def run_batch_submit(chars: list, output_dir: Path, api_key: str, model: str,
-                     image_size: str, aspect_mode: str,
+                     image_size: str, aspect_mode: str, verify_captions: bool,
                      msgq: "queue.Queue[ProgressMsg]", stop_event: threading.Event):
     """Build JSONL, upload, submit batch. Writes _batch.json state file.
     Emits kind='batch_submitted' or kind='error' then 'done'.
@@ -1193,6 +1236,7 @@ def run_batch_submit(chars: list, output_dir: Path, api_key: str, model: str,
         "model": model,
         "image_size": image_size,
         "aspect_mode": aspect_mode,
+        "verify_captions": bool(verify_captions),
         "api_key_hint": f"len={len(api_key)}",  # do NOT persist the key itself
         "total_requests": len(key_map),
         "key_map": key_map,
@@ -1203,9 +1247,10 @@ def run_batch_submit(chars: list, output_dir: Path, api_key: str, model: str,
     except Exception as e:
         msgq.put(ProgressMsg(kind="log", text=f"WARN — state save failed ({e}); batch continues but cannot resume on close"))
 
+    initial_state = getattr(getattr(batch_job, "state", None), "name", "UNKNOWN")
     msgq.put(ProgressMsg(kind="log",
         text=f"Batch submitted: {batch_job.name} · {len(key_map)} request(s) · "
-             f"initial state={batch_job.state.name}"))
+             f"initial state={initial_state}"))
     # Deliberately NOT emitting 'done' here — the poller will emit it on
     # actual completion. Emitting 'done' now would show a misleading
     # "batch finished" log line while the batch is still processing.
@@ -1417,7 +1462,19 @@ def run_batch_poll(output_dir: Path, api_key: str, model: str,
                 img_bytes = base64.b64decode(image_data)
                 with Image.open(BytesIO(img_bytes)) as im:
                     im.save(out_img, format="PNG")
-                out_txt.write_text(caption, encoding="utf-8")
+                # If verify_captions was on at submit time, re-caption via vision
+                # model now using the actual generated image. This keeps batch
+                # mode behaviorally consistent with sync mode's verify toggle.
+                final_caption = caption
+                if state.get("verify_captions"):
+                    try:
+                        trigger = info.get("caption", "").split(",", 1)[0].strip() or char_name
+                        new_cap = engine.caption_image(img_bytes, trigger)
+                        if new_cap and len(new_cap) > 20:
+                            final_caption = new_cap
+                    except Exception:
+                        pass  # fall back to templated caption
+                out_txt.write_text(final_caption, encoding="utf-8")
                 extra = {"category": category} if category else {}
                 record_slot(manifests[char_name], slot, flat, kept=True, **extra)
                 saved += 1
@@ -3435,6 +3492,26 @@ class ForgeApp:
             messagebox.showwarning("nothing to do", "no characters enabled")
             return
 
+        # Validate each enabled character before burning any budget.
+        bad = []
+        trigger_to_names: dict[str, list[str]] = {}
+        for c in enabled:
+            if not c.trigger or not c.trigger.strip():
+                bad.append(f"{c.name}: empty trigger word")
+                continue
+            effective_count = sum(c.distribution.values()) if c.distribution else c.count
+            if effective_count <= 0:
+                bad.append(f"{c.name}: count must be ≥ 1 (got {effective_count})")
+            trigger_to_names.setdefault(c.trigger.strip(), []).append(c.name)
+        # Detect trigger collisions — same trigger ⇒ identical combinatorial seed
+        collisions = [(t, ns) for t, ns in trigger_to_names.items() if len(ns) > 1]
+        for t, ns in collisions:
+            bad.append(f"trigger {t!r} shared by multiple characters ({', '.join(ns)}) — they would generate IDENTICAL datasets. Make each trigger unique.")
+        if bad:
+            messagebox.showerror("cannot start", "Fix these first:\n\n - " + "\n - ".join(bad))
+            self._job_running = False
+            return
+
         root = Path(self.root_var.get())
         output_dir = root / DEFAULT_OUTPUT_SUBDIR
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -3462,6 +3539,7 @@ class ForgeApp:
                 target=run_batch_submit,
                 args=(chars, output_dir, api_key, self.model_var.get(),
                       self.size_var.get(), self.aspect_var.get(),
+                      bool(self.verify_var.get()),
                       self.msgq, self.stop_event),
                 daemon=True,
             )
@@ -3510,6 +3588,31 @@ class ForgeApp:
             return
         name = state.get("batch_name", "?")
         total = state.get("total_requests", 0)
+
+        # Cross-root sanity: if the state file references characters that don't
+        # exist under the current dataset root, user likely changed datasets
+        # between sessions. Warn instead of silently writing to wrong folders.
+        char_names_in_state = {
+            info.get("char") for info in (state.get("key_map") or {}).values()
+        }
+        char_names_in_state.discard(None)
+        scanned_names = {c.name for c in self.chars}
+        missing = char_names_in_state - scanned_names
+        if missing and char_names_in_state:
+            if not messagebox.askyesno(
+                "batch references different characters",
+                f"The pending batch was submitted for character(s) that don't "
+                f"exist under the current dataset root:\n\n"
+                f"  missing: {', '.join(sorted(missing))}\n"
+                f"  current: {', '.join(sorted(scanned_names)) or '(none)'}\n\n"
+                f"Did you change the dataset root since submitting?\n\n"
+                f"Resume anyway? (Choose No to leave the batch alone; you can "
+                f"point the dataset root back at the original folder and "
+                f"relaunch to resume safely.)",
+            ):
+                self._log("[batch] resume declined — pending state preserved", "info")
+                return
+
         self._log(f"[batch] pending batch detected: {name} ({total} req)", "info")
 
         # Pre-populate progress state so the status bar shows sensible counts

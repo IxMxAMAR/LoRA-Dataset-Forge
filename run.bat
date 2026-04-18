@@ -19,10 +19,14 @@ if "%PY%"=="" (
 )
 
 REM Verify dependencies; offer install if missing.
-"%PY%" -c "import google.genai, PIL" 2>nul
+REM Also guard against the wrong SDK — the legacy `google-generativeai` package
+REM installs a `google.genai` namespace too but has no `Client`. Require the
+REM new `google-genai` SDK by checking for `genai.Client`.
+"%PY%" -c "import google.genai as g, PIL; assert hasattr(g, 'Client'), 'wrong SDK'" 2>nul
 if errorlevel 1 (
-    echo [info] Missing dependencies. Run install.bat, or install manually:
+    echo [info] Missing or wrong dependencies. Run install.bat, or install manually:
     echo        %PY% -m pip install -r requirements.txt
+    echo        (Requires `google-genai`, not the legacy `google-generativeai`.)
     pause
     exit /b 1
 )
