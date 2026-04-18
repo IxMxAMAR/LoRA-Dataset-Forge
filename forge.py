@@ -2378,7 +2378,10 @@ config:
           caption_dropout_rate: 0.05
           shuffle_tokens: false
           cache_latents_to_disk: true
-          resolution: [ 768, 1024, 1344 ]
+          # Standard multi-res bucket. If you have 32GB+ VRAM and want a
+          # marginal quality bump at the cost of ~40% longer training,
+          # change to [ 768, 1024, 1344 ].
+          resolution: [ 512, 768, 1024 ]
       train:
         batch_size: 2
         cache_text_embeddings: true
