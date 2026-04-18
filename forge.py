@@ -754,7 +754,8 @@ def run_job(chars, root, output_dir, api_key, model, image_size, aspect_mode,
         done = 0
         refused = 0
         errors = 0
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers))
+        try:
             futures = {}
             slot_category_map: dict[int, Optional[str]] = {}
             for slot, flat, spec, outfit, category in new_jobs_full:
@@ -766,8 +767,11 @@ def run_job(chars, root, output_dir, api_key, model, image_size, aspect_mode,
 
             for fut in concurrent.futures.as_completed(futures):
                 if stop_event.is_set():
-                    for f in futures:
-                        f.cancel()
+                    # cancel_futures=True skips any pending work; wait=False
+                    # detaches from still-running futures so Stop completes
+                    # immediately instead of blocking up to workers × 300s
+                    # for Gemini calls to time out.
+                    pool.shutdown(wait=False, cancel_futures=True)
                     break
                 try:
                     kind, info = fut.result()
@@ -805,6 +809,15 @@ def run_job(chars, root, output_dir, api_key, model, image_size, aspect_mode,
                     errors += 1
                     msgq.put(ProgressMsg(kind="error", char=char.name,
                         text=f"[{char.name}] {info['slot']:03d} failed: {info['err']}"))
+        finally:
+            # Always shut down the pool — explicit shutdown needed since we
+            # dropped the `with` context manager above. wait=False is safe
+            # here because the loop already drained all futures or was
+            # explicitly cancelled via stop_event.
+            try:
+                pool.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
 
         msgq.put(ProgressMsg(kind="char_done", char=char.name))
         msgq.put(ProgressMsg(kind="log",
@@ -1546,6 +1559,13 @@ def run_batch_poll(output_dir: Path, api_key: str, model: str,
                 msgq.put(ProgressMsg(kind="error", char=char_name,
                                      text=f"[{char_name}] {slot:03d} save failed: {e}"))
         else:
+            # Don't stomp a successfully-saved slot's manifest entry with a
+            # refusal from a stale or duplicate batch result. If the PNG+TXT
+            # are already present and valid on disk, preserve the existing
+            # kept=True record.
+            if _slot_file_complete(out_char, slot):
+                already_present += 1
+                continue
             refused += 1
             extra = {"refused": True, "refuse_reason": (refusal_text or "no image")[:200]}
             if category:
@@ -3647,6 +3667,15 @@ class ForgeApp:
         if not api_key:
             self._log("[batch] no API key; cannot poll", "err")
             return
+        # Wait briefly for the prior (submit) thread to finish emitting its
+        # final messages before clobbering self.worker. The submit thread
+        # emits batch_submitted immediately before returning, so this join
+        # normally completes in <1ms; the timeout is defense-in-depth.
+        if self.worker is not None and self.worker.is_alive():
+            try:
+                self.worker.join(timeout=2.0)
+            except Exception:
+                pass
         # Don't clear stop_event here — if a submit thread is still unwinding
         # after a Stop press, clearing would silently re-enable it. The submit
         # path clears stop_event in _start_job when the user clicks Generate.
