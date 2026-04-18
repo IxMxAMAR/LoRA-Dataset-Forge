@@ -204,14 +204,24 @@ All settings auto-save to `_settings.json` next to the tool (gitignored — don'
 
 Rough per-image numbers for Nano Banana 2 at 2K:
 
-| dataset | cost |
-|---|---|
-| 30 images (one character) | ~$1.20 |
-| 210 images (7 characters × 30) | ~$8.20 |
-| 700 images (7 × 100) | ~$27 |
-| Same 700 with `verify captions` on | ~$27.10 |
+| dataset | sync | batch (50% off) |
+|---|---|---|
+| 30 images (one character) | ~$1.20 | ~$0.60 |
+| 210 images (7 × 30) | ~$8.20 | ~$4.10 |
+| 700 images (7 × 100) | ~$27 | ~$13.50 |
 
 Nano Banana Pro is roughly 3× more per image — worth it for a final polish pass, overkill for prototyping. See the live cost estimator in the app for the actual number on your current batch.
+
+## Sync vs batch — practical guidance
+
+**Use sync mode (default) for small runs up to ~100 images per character.** Wall clock is ~40 seconds per 30 images with 4 workers, and you get live feedback. The 50% batch discount on a $1.20 run saves $0.60 — not worth giving up instant feedback.
+
+**Batch mode is worth considering when:**
+- You're doing 300+ images per character in one shot (savings exceed $5+)
+- You genuinely don't care about wait time (can walk away for hours)
+- You've already submitted a test batch in the current session and confirmed Google's pipeline is cooperating
+
+**Batch mode caveat:** `gemini-3.1-flash-image-preview` (Nano Banana 2) is a preview model, and Google's Batch API for image models currently doesn't emit intermediate progress (`completion_stats` stays null during execution, `start_time` may never populate). A batch can be RUNNING for 30+ minutes without any server-side updates and either eventually complete cleanly or wedge indefinitely. The tool auto-detects wedges at 15 min and suggests cancelling. If your batch sits silent for longer than that, cancel and switch to sync.
 
 ---
 
